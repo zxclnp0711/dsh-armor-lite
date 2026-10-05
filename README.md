@@ -10,8 +10,8 @@ DeepSeek Harness 的**轻量破甲插件**：只改运行时，不改任何官�
 ## 安装
 
 ```sh
-# 从仓库装
-dsh plugin --profile desktop add github:OWNER/dsh-armor-lite
+# 从仓库装（私有仓：本机需先有可用的 SSH key 并已加到 GitHub）
+dsh plugin --profile desktop add github:zxclnp0711/dsh-armor-lite
 
 # 或从本地目录装
 dsh plugin --profile desktop add /path/to/dsh-armor-lite
