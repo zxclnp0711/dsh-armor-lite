@@ -1,0 +1,14 @@
+# 依赖与产物
+node_modules/
+pnpm-lock.yaml
+package-lock.json
+
+# 本地/临时
+*.log
+*.tmp
+.DS_Store
+Thumbs.db
+
+# 人设与状态的本地副本（真身在 $DSH_HOME/armor/）
+armor/
+state.json

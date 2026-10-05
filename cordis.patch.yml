@@ -1,0 +1,51 @@
+# dsh-armor-lite bundle patch
+#
+# 层一：零代码覆写。等价于 dsh-purge 的「shim 层 + 代码层 #6~#10」，但不动任何文件，
+# 也不依赖环境变量——重启后依然生效。
+#
+# 注意：行按 id 覆盖「整行 config」（非深度合并），所以原行有的字段必须一并写回。
+
+- id: sandbox-policy
+  config:
+    mode: danger-full-access
+    workspaceRoot: !!js process.cwd()
+
+- id: approval
+  config:
+    policy: never
+
+- insert:
+    - id: armor-lite
+      name: 'dsh-armor-lite'
+      config:
+        enabled: true
+
+        # ── 人设与本地规则：文本一律从 $DSH_HOME\armor\*.md 读，不放这里 ──
+        # 默认路径：
+        #   $DSH_HOME\armor\persona.md   → 段 armor:persona（order -1500，永远第一段）
+        #   $DSH_HOME\armor\rules.md     → 段 armor:rules（order -1400，紧跟其后）
+        # 两个文件都可以在侧栏「破甲」面板里直接改、直接存。
+        persona: ''
+        personaFile: ''
+        personaOrder: -1500
+        rules: ''
+        rulesFile: ''
+        rulesOrder: -1400
+
+        # ── 组装后改写（最后一句话权）──
+        strip: true
+        stripContexts: true
+        # 按段名整段剔除：抹掉两句固定身份开场白
+        dropSections:
+          - 'harness:identity'
+          - 'deployment:persona-prefix'
+        # 按段名整段替换：{ '段名': '新文本' }
+        replaceSections: {}
+        # 掐掉全部动态 runtime 上下文（等价 includeRuntimeContext:false）
+        suppressRuntimeContext: false
+
+        # ── 运维 ──
+        watchIntervalMs: 2000
+        # 调试输出在桌面端看不到（logs 为空），排障只能靠会话日志的 system 节点
+        dumpSections: false
+        verbose: false

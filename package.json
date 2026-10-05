@@ -1,0 +1,39 @@
+{
+  "name": "dsh-armor-lite",
+  "version": "0.2.0",
+  "description": "轻量破甲：YAML 权限层 + 运行时系统提示词改写 + 自定义人设/规则 + 侧栏破甲面板",
+  "type": "module",
+  "main": "index.js",
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./cordis.patch.yml": "./cordis.patch.yml",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "index.js",
+    "client.js",
+    "strip-rules.js",
+    "cordis.patch.yml",
+    "personas"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "immediately": true,
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-settings"
+      ]
+    }
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "^4.0.1"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "private": true
+}
