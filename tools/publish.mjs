@@ -32,7 +32,35 @@ import { fileURLToPath } from 'node:url'
 
 const repo = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
 const argv = process.argv.slice(2)
-const TOKEN = process.env.GITHUB_TOKEN || process.env.GH_TOKEN || ''
+
+/**
+ * 取 token：先看进程环境，再（Windows）查用户级注册表。
+ *
+ * 为什么必须有第二条：`setx` 只写注册表，而新进程是从**父进程**继承环境的，
+ * Explorer 的环境块又经常不刷新 —— 于是从托盘/开始菜单启动的 DSH 继承不到，
+ * 表现为「明明 setx 成功了却读不到」。这一步就是给这个经典坑兜底。
+ * 值只在内存里流转：不打印、不落盘、不进 argv。
+ *
+ * @returns {{ value: string, from: string | null }}
+ */
+function readToken() {
+  if (process.env.GITHUB_TOKEN) return { value: process.env.GITHUB_TOKEN, from: 'env:GITHUB_TOKEN' }
+  if (process.env.GH_TOKEN) return { value: process.env.GH_TOKEN, from: 'env:GH_TOKEN' }
+  if (process.platform !== 'win32') return { value: '', from: null }
+  for (const name of ['GITHUB_TOKEN', 'GH_TOKEN']) {
+    try {
+      const r = spawnSync('reg', ['query', 'HKCU\\Environment', '/v', name], { encoding: 'utf8' })
+      if (r.status !== 0 || !r.stdout) continue
+      const m = new RegExp(`${name}\\s+REG_(?:SZ|EXPAND_SZ)\\s+(.+)$`, 'm').exec(r.stdout)
+      const v = m && m[1] ? m[1].trim() : ''
+      if (v) return { value: v, from: `注册表 HKCU\\Environment\\${name}` }
+    } catch { /* reg 不可用就当没有 */ }
+  }
+  return { value: '', from: null }
+}
+
+const TOKEN_INFO = readToken()
+const TOKEN = TOKEN_INFO.value
 
 const flag = (name) => {
   const i = argv.indexOf(name)
@@ -188,7 +216,7 @@ if (has('--status')) {
   console.log(`[publish] branch = ${branch}`)
   console.log(`[publish] origin = ${readOrigin() ?? '(未设置，用 --remote <url> 设置)'}`)
   console.log(`[publish] slug   = ${readSlug() ?? '(还不是 GitHub 地址)'}`)
-  console.log(`[publish] token  = ${TOKEN ? '已设置（值不显示）' : '(未设置，--release 用不了)'}`)
+  console.log(`[publish] token  = ${TOKEN ? `已设置（来源：${TOKEN_INFO.from}）` : '(未设置，--release 用不了)'}`)
   console.log(`[publish] 本地 tag = ${(() => {
     const r = spawnSync('git', ['-C', repo, 'tag', '-l'], { encoding: 'utf8' })
     return r.status === 0 && r.stdout.trim() ? r.stdout.trim().split('\n').join(', ') : '(无)'
