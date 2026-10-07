@@ -35,14 +35,36 @@
         # ── 组装后改写（最后一句话权）──
         strip: true
         stripContexts: true
+        # 工具描述也要洗（模型选工具的依据；purge 靠文件补丁改这层，这里运行时改）
+        stripTools: true
         # 按段名整段剔除：抹掉两句固定身份开场白
         dropSections:
           - 'harness:identity'
           - 'deployment:persona-prefix'
         # 按段名整段替换：{ '段名': '新文本' }
         replaceSections: {}
+        # 自定义改写表（{ pattern, flags, replace }）；null = 用 strip-rules.js
+        stripRules: null
         # 掐掉全部动态 runtime 上下文（等价 includeRuntimeContext:false）
         suppressRuntimeContext: false
+
+        # ── 拒答恢复 / 空转续写（事件层，实现见 refusal-recover.js）──
+        refusalRecover: true
+        refusalRecoverMax: 2
+        # 连续拒答链上限（拒答→补话→又拒答 每轮都是新 turn，per-turn 上限拦不住）0 = 不限
+        refusalRecoverChainMax: 3
+        # 留空 = 用 refusal-recover.js 里的内置补话
+        refusalRecoverText: ''
+        # 拒答词只在这条回复的开头 N 字符内判定，避免误伤正常回答里的「抱歉」
+        refusalRecoverHeadLimit: 240
+        # 只在 reason.kind === 'max-tokens'（被截断）时补话，不碰 error / aborted
+        autoContinue: true
+        autoContinueMax: 3
+        autoContinueText: '继续'
+        # 不替子代理兜底，避免父子互相恢复绕圈
+        skipSubagentRecover: true
+        # 硬停白名单（字符串按正则源处理）；null = 用内置
+        hardStopPatterns: null
 
         # ── 运维 ──
         watchIntervalMs: 2000

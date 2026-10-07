@@ -44,22 +44,26 @@ window.__ModuleLoader__.load({
     })
 
     // ── 控件 ──────────────────────────────────────────────────────────
-    function Switch({ on, busy, onChange }) {
+    function Switch({
+      on, busy, onChange, compact,
+      onText = '破甲 · 已开启', offText = '破甲 · 已关闭',
+      onTitle = '点击关闭破甲（回到原版提示词）', offTitle = '点击开启破甲',
+    }) {
       return h('button', {
         type: 'button',
         role: 'switch',
         'aria-checked': on ? 'true' : 'false',
         disabled: busy,
         onClick: () => onChange(!on),
-        title: on ? '点击关闭破甲（回到原版提示词）' : '点击开启破甲',
+        title: on ? onTitle : offTitle,
         style: {
-          display: 'inline-flex', alignItems: 'center', gap: 9,
-          padding: '7px 14px', borderRadius: 999,
+          display: 'inline-flex', alignItems: 'center', gap: compact ? 7 : 9,
+          padding: compact ? '5px 11px' : '7px 14px', borderRadius: 999,
           cursor: busy ? 'wait' : 'pointer',
           border: `1px solid ${on ? T.brand : T.border}`,
           background: on ? T.brand : T.layer1,
           color: on ? '#fff' : T.label2,
-          fontSize: 13, fontWeight: 600, fontFamily: 'inherit',
+          fontSize: compact ? 12 : 13, fontWeight: 600, fontFamily: 'inherit',
         },
       },
         h('span', {
@@ -69,7 +73,7 @@ window.__ModuleLoader__.load({
             opacity: on ? 1 : 0.55,
           },
         }),
-        on ? '破甲 · 已开启' : '破甲 · 已关闭',
+        on ? onText : offText,
       )
     }
 
@@ -156,7 +160,7 @@ window.__ModuleLoader__.load({
           if (!alive.current) return
           setDirty((d) => ({ ...d, [which]: false }))
           setNote({ kind: 'ok', text: `已保存 ${body.bytes} 字节 → ${body.path}（约 2 秒内对后续请求生效）` })
-          setData((s) => (s ? { ...s, [which]: { ...s[which], text, bytes: body.bytes, source: body.path } } : s))
+          setData((s) => (s ? { ...s, [which]: { ...s[which], text, bytes: body.bytes, source: body.path, persisted: true } } : s))
         } catch (e) {
           if (alive.current) setNote({ kind: 'err', text: `保存失败：${e.message}` })
         } finally {
@@ -164,18 +168,30 @@ window.__ModuleLoader__.load({
         }
       }
 
-      const toggle = async (next) => {
+      const NOTE = {
+        armed: {
+          on: '破甲已开启：人设/规则段生效，固定身份开场白被剔除，削减文案改写生效。',
+          off: '破甲已关闭：人设/规则段清空、改写停用、身份开场白恢复 —— 等同于原版 DSH。',
+        },
+        recover: {
+          on: '拒答恢复已开启：一轮正常收尾但内容是拒答时，自动补一句把它顶回去（每轮上限 2 次）。',
+          off: '拒答恢复已关闭：模型拒答时不再自动补话。',
+        },
+        continue: {
+          on: '空转续写已开启：输出被 max-tokens 截断时自动补「继续」（每轮上限 3 次）。',
+          off: '空转续写已关闭。',
+        },
+      }
+
+      // key: 'armed' | 'recover' | 'continue'
+      const toggle = async (key, next) => {
         setBusy('toggle')
         try {
-          const body = await postJson('/toggle', { enabled: next })
+          const body = await postJson('/toggle', { key, enabled: next })
           if (!alive.current) return
-          setData((s) => (s ? { ...s, armed: body.armed } : s))
-          setNote({
-            kind: body.armed ? 'ok' : 'warn',
-            text: body.armed
-              ? '破甲已开启：人设/规则段生效，固定身份开场白被剔除，削减文案改写生效。'
-              : '破甲已关闭：人设/规则段清空、改写停用、身份开场白恢复 —— 等同于原版 DSH。',
-          })
+          setData((s) => (s ? { ...s, [key]: body[key] } : s))
+          const on = !!body[key]
+          setNote({ kind: on ? 'ok' : 'warn', text: NOTE[key] ? NOTE[key][on ? 'on' : 'off'] : `${key} → ${on}` })
         } catch (e) {
           if (alive.current) setNote({ kind: 'err', text: `切换失败：${e.message}` })
         } finally {
@@ -216,7 +232,7 @@ window.__ModuleLoader__.load({
           h('span', { style: { fontSize: 12, color: T.label2 } },
             '运行时改写系统提示词 · 不改任何官方文件'),
           h('span', { style: { flex: 1 } }),
-          h(Switch, { on: !!data.armed, busy: busy === 'toggle', onChange: (v) => void toggle(v) }),
+          h(Switch, { on: !!data.armed, busy: busy === 'toggle', onChange: (v) => void toggle('armed', v) }),
         ),
 
         h('div', {
@@ -230,7 +246,32 @@ window.__ModuleLoader__.load({
           h('div', {}, '段顺序：armor:persona (-1500) → armor:rules (-1400) → 第一方指导'),
           h('div', {}, '剔除的身份段：harness:identity、deployment:persona-prefix'),
           h('div', {}, `文件目录：${data.home}`),
-          h('div', {}, `外部直接改文件也会在 ${data.watchIntervalMs || 2000} ms 内被读到；开关状态存在 state.json，重启后保持。`),
+          h('div', {}, `外部直接改人设/规则文件会在 ${data.watchIntervalMs || 2000} ms 内被读到；三个开关写在 state.json，重启后保持（外部改那个文件要重启才读）。`),
+        ),
+
+        h('div', {
+          key: 'switches',
+          style: {
+            marginTop: 12, padding: '12px 14px', borderRadius: 12,
+            background: T.layer2, border: `1px solid ${T.border}`,
+            display: 'flex', gap: 10, flexWrap: 'wrap', alignItems: 'center',
+          },
+        },
+          h('span', { style: { fontSize: 12, color: T.label2 } }, '附加层（事件级，不碰提示词）：'),
+          h(Switch, {
+            on: !!data.recover, busy: busy === 'toggle', compact: true,
+            onChange: (v) => void toggle('recover', v),
+            onText: '拒答恢复 · 开', offText: '拒答恢复 · 关',
+            onTitle: '拒答会被自动顶回去；点击关闭', offTitle: '模型拒答时不动它；点击开启',
+          }),
+          h(Switch, {
+            on: !!data.continue, busy: busy === 'toggle', compact: true,
+            onChange: (v) => void toggle('continue', v),
+            onText: '空转续写 · 开', offText: '空转续写 · 关',
+            onTitle: '输出被 max-tokens 截断时自动补「继续」；点击关闭', offTitle: '点击开启',
+          }),
+          h('span', { style: { fontSize: 11.5, color: T.label2 } },
+            `每轮上限 ${data.recoverMax ?? 2} / ${data.continueMax ?? 3} 次；破甲总开关关掉时这两个也停。`),
         ),
 
         note ? h('div', {

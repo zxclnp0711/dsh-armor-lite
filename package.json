@@ -1,7 +1,7 @@
 {
   "name": "dsh-armor-lite",
-  "version": "0.2.0",
-  "description": "轻量破甲：YAML 权限层 + 运行时系统提示词改写 + 自定义人设/规则 + 侧栏破甲面板",
+  "version": "0.3.0",
+  "description": "轻量破甲：YAML 权限层 + 运行时系统提示词改写 + 自定义人设/规则 + 拒答恢复 + 侧栏破甲面板",
   "type": "module",
   "main": "index.js",
   "exports": {
@@ -14,6 +14,7 @@
     "index.js",
     "client.js",
     "strip-rules.js",
+    "refusal-recover.js",
     "cordis.patch.yml",
     "personas"
   ],

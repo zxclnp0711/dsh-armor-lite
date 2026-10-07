@@ -2,9 +2,10 @@
 
 DeepSeek Harness 的**轻量破甲插件**：只改运行时，不改任何官方文件。
 
-- **体量**：7 个文件、约 33 KB、零 `@deepseek-ai/*` 运行时依赖（只声明 peerDep `cordis`）
+- **体量**：8 个文件、零 `@deepseek-ai/*` 运行时依赖（只声明 peerDep `cordis`）
 - **破甲方式**：`system-prompt/assemble` 瀑布最外层改写 + 按段名剔除固定身份开场白 + 前置自定义人设/规则
 - **人设与规则**：纯 markdown 文件，2 秒热生效，也可在侧栏图形面板里改
+- **拒答恢复**：一轮正常收尾但内容是拒答时自动补话顶回去；被 max-tokens 截断时自动续写（事件层，可关）
 - **官方更新免疫**：不发一个补丁到 `node_modules`，官方覆盖文件也打不回来
 
 ## 安装
@@ -30,12 +31,13 @@ dsh-armor-lite/
 ├─ index.js              # Host 半：两段注入、组装后改写、开关、HTTP 桥
 ├─ client.js             # Client 半：侧栏「破甲」入口 + 中央面板（React，无 Harness 客户端包依赖）
 ├─ strip-rules.js        # 削减文案改写表（可自由增删）
+├─ refusal-recover.js    # 拒答自动恢复 + 空转续写（纯事件层，不碰提示词）
 └─ personas/
    ├─ default.md         # 人设段的内置默认（\$DSH_HOME/armor/persona.md 不存在时用它）
    └─ default-rules.md   # 规则段的内置默认
 ```
 
-## 三个工作机制
+## 四个工作机制
 
 ### 1. 权限层（纯 YAML，零代码）
 
@@ -74,11 +76,44 @@ ctx.on('system-prompt/assemble', async (assembly, _context, next) => {
 }, { global: true, prepend: true })   // global + prepend = 最外层监听器
 ```
 
-`rewrite()` 做三件事，全部只作用于文本、不改变段的数量与顺序：
+`rewrite()` 做四件事，全部只作用于文本、不改变段的数量与顺序：
 
 1. `dropSections` — 按段名整段剔除，默认 `harness:identity` + `deployment:persona-prefix`（两句固定身份开场白）
 2. `replaceSections` — 按段名整段替换
-3. `stripRules` — 正则改写表（`strip-rules.js`），默认含三段 `dsh-agent-instructions` 降级文案的逐字核对版
+3. `stripRules` — 正则改写表（`strip-rules.js`），默认含三段 `dsh-agent-instructions` 降级文案、「审批 / 升级」一组、「工具结果定性」一组的逐字核对版
+4. `stripTools` — 工具描述（`assembly.tools[].description`）也过一遍改写表
+
+第 4 条是**兜底，当前在本机是空转的**。要澄清一件事：那些「untrusted / 仅供参考」的措辞实际上全在 prompt **sections** 里 —— `dsh-tool-web` 用 `systemPrompt.section()` 注册行为指导文本（该包 `lib/index.js` 里 web_fetch 那一行），第 3 条早就改到了；dsh-purge 的 `TOOL_WEB_UNTRUSTED_NEUTRAL` 补丁改的也是同一个文件。
+
+核对方式：会话日志里的 `request/header` 事件记录了完整的 tools schema。实测本机最后一次请求的 58 个工具，`description` 里没有这类措辞，`stripTools` 命中 0。留着它是防宿主升级后把文案挪进 `description`；命中 0 时原样返回对象，没有副作用。
+
+### 4. 拒答恢复 / 空转续写（事件层）
+
+`refusal-recover.js`。监听 `agent/status`，在 `status === 'idle'` 时读该会话最后一个 `turn/end`：
+
+| `reason.kind` | 动作 |
+|---|---|
+| `completed` + 助手回复开头命中拒答特征 | 用 `agent.followup()` 补一条 user 消息顶回去，每轮上限 `refusalRecoverMax`（默认 2） |
+| `max-tokens` | 补一句「继续」，每轮上限 `autoContinueMax`（默认 3） |
+| `aborted` / `error` | 不动 —— 那是真故障，接管只会掩盖问题 |
+
+```js
+ctx.on('agent/status', (payload) => {
+  if (payload.status !== 'idle') return
+  agent.followup({ id, role: 'user', content: [{ type: 'text', text }], source: { kind: 'user' } })
+}, { global: true, prepend: true })
+```
+
+三处与 dsh-purge 原版的差异（都对着本机 0.2.0-rc.2 源码核过，不是照抄）：
+
+- `payload.agent` 确实存在 —— `agentEvents()` 的 `fused(payload) = { ...payload, agent }` 会注入 agent
+- 消息来源用 `{ kind: 'user' }`，**不用** purge 的 `{ kind: 'plugin' }` —— 本机 `MessageSourceMap` 枚举里没有 `plugin`
+- 多两道保险：拒答词只在回复开头 `refusalRecoverHeadLimit` 个字符内判定（避免「抱歉，我看错了」被误判成拒答）；默认不替子代理兜底，避免父子互相恢复绕圈
+
+维护这个模块时记住两条（代码注释里也写了，别改回去）：
+
+- **事件形状**：正文在 `assistant/message` 的 `data.message.content`，**不是** `data.content`。第一版按 `data.content` 读，导致判定恒 false、拒答恢复一次都不会触发，而且**一个字都不报**。当时的自测用的是想象中的事件结构，跟着一起错、还全绿。现在 `tools/selftest.mjs` 的 `[0]` 段专门钉这件事，结构取自真实会话日志。
+- **正则别写 `[^.]*`**：`[^.]` 在 JS 里匹配换行，锚点短语后面若长时间不出现英文句点，会把整段（代码块、路径、中文段落）一起吞掉再替换成一句短语。要「到句号为止」的规则一律写 `[^.\n]{0,200}\.`，跨行或超长时直接不命中，比吞段安全。
 
 ## 设置面板
 
@@ -88,15 +123,17 @@ ctx.on('system-prompt/assemble', async (assembly, _context, next) => {
 |---|---|
 | 人设 | 读 / 改 / 保存 → `$DSH_HOME/armor/persona.md` |
 | 规则 | 读 / 改 / 保存 → `$DSH_HOME/armor/rules.md` |
-| 破甲开关 | 关闭 = 两段清空 + 改写停用 + 身份开场白恢复，即原版 DSH；状态持久化在 `armor/state.json` |
+| 破甲开关 | 关闭 = 两段清空 + 改写停用 + 身份开场白恢复 + 拒答恢复停用，即原版 DSH；状态持久化在 `armor/state.json` |
+| 拒答恢复 | 事件层开关，与破甲总开关联动（总开关关掉时它也停） |
+| 空转续写 | 事件层开关，同上 |
 
 面板与 Host 之间走同源 HTTP 桥（宿主 `webServer` 的 `kind: 'exact'` 路由）：
 
 | 路由 | 方法 | 说明 |
 |---|---|---|
-| `/dsh-armor/api/state` | GET | `{ armed, home, watchIntervalMs, persona, rules }` |
+| `/dsh-armor/api/state` | GET | `{ armed, recover, continue, home, watchIntervalMs, recoverMax, continueMax, persona, rules }` |
 | `/dsh-armor/api/save` | POST | `{ which: 'persona'\|'rules', text }` → 写盘并立即生效 |
-| `/dsh-armor/api/toggle` | POST | `{ enabled: boolean }` → 切换并存 `state.json` |
+| `/dsh-armor/api/toggle` | POST | `{ enabled: boolean, key?: 'armed'\|'recover'\|'continue' }` → 切换并存 `state.json`；`key` 省略即 `armed`，旧调用照旧可用 |
 
 ## 配置项（`cordis.patch.yml` 的 `config`）
 
@@ -108,14 +145,31 @@ ctx.on('system-prompt/assemble', async (assembly, _context, next) => {
 | `personaOrder` / `rulesOrder` | `-1500` / `-1400` | 段顺序；必须低于 `-1000` 才能压过 harness 身份 |
 | `strip` | `true` | 是否启用组装后改写 |
 | `stripContexts` | `true` | 是否把改写也应用到动态 runtime 上下文 |
+| `stripTools` | `true` | 是否把改写也应用到工具描述（`tools[].description`） |
 | `stripRules` | `null` | 自定义改写表（`{pattern, flags, replace}`）；`null` 用 `strip-rules.js` |
 | `dropSections` | `['harness:identity','deployment:persona-prefix']` | 按段名整段剔除 |
 | `replaceSections` | `{}` | 按段名整段替换 |
 | `suppressRuntimeContext` | `false` | 掐掉全部动态 runtime 上下文 |
+| `refusalRecover` | `true` | 拒答自动恢复总闸（与面板的开关是「与」关系） |
+| `refusalRecoverMax` | `2` | 每轮最多恢复几次，0 = 关，上限 5 |
+| `refusalRecoverChainMax` | `3` | 连续拒答链上限：拒答→补话→又拒答会一直开新 turn，per-turn 上限每轮归零拦不住，靠这条兜底；中间出现一次正常回答即清零；0 = 不限 |
+| `refusalRecoverText` | `''` | 恢复补话，留空用内置 |
+| `refusalRecoverHeadLimit` | `240` | 拒答词只在这条回复的开头 N 字符内判定 |
+| `autoContinue` | `true` | 空转续写总闸 |
+| `autoContinueMax` | `3` | 每轮最多续写几次，0 = 关，上限 20 |
+| `autoContinueText` | `'继续'` | 续写补话 |
+| `skipSubagentRecover` | `true` | 不替子代理兜底 |
+| `hardStopPatterns` | `null` | 硬停白名单（字符串按正则源处理）；`null` 用内置 |
 | `watchIntervalMs` | `2000` | 文件轮询间隔 |
 | `dumpSections` / `verbose` | `false` | 排障用；桌面端的 `console.log` 不可见，验证请看会话日志的 system 节点 |
 
 ## 验证方法
+
+改完 `strip-rules.js` / `refusal-recover.js` 先跑离线自测 —— 它自己把 `DSH_HOME` 指到临时目录，不碰你的真实配置，也不用重启宿主：
+
+```sh
+node tools/selftest.mjs        # 42 项，退出码非 0 表示有失败
+```
 
 宿主插件改动**必须重启**才生效；客户端改动刷新页面即可。验证最终渲染结果（这是模型真正看到的东西）：
 
@@ -123,7 +177,11 @@ ctx.on('system-prompt/assemble', async (assembly, _context, next) => {
 2. 按 **zstd 帧魔数 `28 B5 2F FD` 切分后逐帧解压**（直接 `zstdDecompressSync` 整文件只能得到第一帧）
 3. 取最后一个含 `"role":"system"` 的事件，其 `data.message.content[].text` 即渲染后的系统提示词
 
+> 注意取样范围：`role: "system"` 那条**只含 sections**。动态 runtime context（审批策略、文件策略那些）是 `agent/pre-step` 单独挂上去的另一条消息，不在 system 消息里 —— 要验证 contexts 的改写，得把那条消息也取出来看。
+
 期望：第一段是 `armor:persona` 的内容，紧随 `armor:rules`，且 `You are an AI agent powered by DeepSeek Harness` 与 `You are a coding agent powered by … model` **均为 0 命中**。
+
+拒答恢复的验证不用等模型真拒答：在会话日志里找 `source.kind === "user"` 且文本等于 `refusalRecoverText`（或内置补话）的消息事件，有就说明补话路径通。开关关闭时该事件不应出现。
 
 ## 已知限制
 
@@ -131,6 +189,8 @@ ctx.on('system-prompt/assemble', async (assembly, _context, next) => {
 - 面板文案目前是硬编码中文，未接入宿主 locale 服务。
 - HTTP 桥未做额外的 origin 校验（依赖宿主 webServer 的默认绑定与同源请求）。
 - `strip-rules.js` 中针对 `dsh-agent-instructions` 的三条规则，在该插件行被禁用时属于空转（无副作用），是留给该行被启用时的保险。
+- **`complete` 段的死角（宿主结构，改不掉）**：`SystemPrompt.assemble()` 在 `system-prompt/assemble` 瀑布返回之后还有一步强制覆盖 —— 只要合并后的段里存在任何 `complete: true`，最终 `sections` 会被替换成那一段，本插件的 `dropSections` / `replaceSections` / `stripRules` 全部作废（`contexts` 的改写不受影响）。当前现役 preset（redteam / seep / tongjiapo / krea2-unrestricted）都只用 `prefix`，不开 `complete`，所以不受影响。哪天用了开 `complete` 的 preset（老备份里的 minimal-v6 / qingyue-mother / anchored-standard 就是这种），改写会**静默失效**，没有报错。
+- 拒答识别是正则，不是分类器：正常回答里如果开头就有「抱歉 / 不能」这类词，可能被误判成拒答、多顶一轮。`refusalRecoverHeadLimit` 把判定面限制在开头，`hardStopPatterns` 用来排除刻意的闸门。真被误伤就把开关关掉。
 
 ## 环境
 
@@ -142,7 +202,9 @@ ctx.on('system-prompt/assemble', async (assembly, _context, next) => {
 
 | | dsh-purge | dsh-armor-lite |
 |---|---|---|
-| 破甲层数 | 提示词 + 代码 + shim + override 四层、74 条补丁 | YAML 两行 + 一段运行时改写 |
+| 破甲层数 | 提示词 + 代码 + shim + override 四层、74 条补丁 | YAML 两行 + 一段运行时改写 + 一个事件层 |
 | 是否改官方文件 | 改（并留 `.bak`，官方更新后需重打） | **不改** |
-| 文件量 | 106 个 | 7 个 |
+| 文件量 | 60+ 个，core.js 单文件 282 KB | 8 个，最大 16 KB |
 | 官方更新后 | 需重新 apply | 自动继续生效 |
+| 拒答恢复 | 有 | 有（这里也抄了，并按本机源码校正过三处） |
+| 演练台 / 事实库 / rewind | 有 | 不需要 |

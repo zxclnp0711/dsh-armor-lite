@@ -8,12 +8,20 @@
 //     拿到的是各层处理完的最终 assembly，返回值就是交付给模型的提示词 —— 层序无关，
 //     官方更新覆盖文件也打不回来。
 //  4. 侧栏「破甲」面板（Client 半）通过 /dsh-armor/api/* 读写本文件持有的状态。
+//  5. 拒答自动恢复 / 空转续写走 refusal-recover.js（事件层：agent/status + agent.followup），
+//     与提示词组装无关，但受同一个破甲总开关约束 —— 破甲关掉它就跟着停。
+//
+// 注意（宿主结构死角，复核时确认）：system-prompt 的 assemble() 在瀑布返回之后还有一步
+// 强制覆盖 —— 只要有任何一段带 complete:true，最终 sections 会被换成那一段，本插件的
+// drop/strip 全部作废。本机现役 preset（redteam/seep/tongjiapo/krea2-unrestricted）都只用
+// prefix，不开 complete，所以不受影响；哪天用了开 complete 的 preset，这里的改写会静默失效。
 
 import fs from 'node:fs'
 import path from 'node:path'
 import os from 'node:os'
 import { fileURLToPath } from 'node:url'
 import { DEFAULT_STRIP_RULES } from './strip-rules.js'
+import { installRefusalRecover } from './refusal-recover.js'
 
 export const name = 'dsh-armor-lite'
 export const inject = ['systemPrompt']
@@ -39,16 +47,31 @@ const DEFAULTS = {
   // 组装后处理
   strip: true,
   stripContexts: true,
+  stripTools: true,
   stripRules: null,
   dropSections: ['harness:identity', 'deployment:persona-prefix'],
   replaceSections: {},
   suppressRuntimeContext: false,
+
+  // 拒答恢复 / 空转续写（实现见 refusal-recover.js）
+  refusalRecover: true,
+  refusalRecoverMax: 2,
+  refusalRecoverChainMax: 3,
+  refusalRecoverText: '',
+  refusalRecoverHeadLimit: 240,
+  autoContinue: true,
+  autoContinueMax: 3,
+  autoContinueText: '继续',
+  skipSubagentRecover: true,
+  hardStopPatterns: null,
 
   // 运维
   watchIntervalMs: 2000,
   dumpSections: false,
   verbose: false,
 }
+
+const TOGGLE_KEYS = ['armed', 'recover', 'continue']
 
 const SECTION_SPECS = [
   {
@@ -149,31 +172,83 @@ function rewrite(assembly, rules, config) {
         return got.text === entry.text ? entry : { ...entry, text: got.text }
       })
 
+  // 工具描述兜底。先澄清一件事：本机的「untrusted / 仅供参考」措辞其实**全在 prompt sections 里**
+  // （dsh-tool-web 用 systemPrompt.section() 注册行为指导文本），上面第 3 步早就改到了；
+  // purge 的 TOOL_WEB_UNTRUSTED_NEUTRAL 补丁改的也是同一个文件。
+  // 实测最后一次请求的 request/header（会话日志记录完整 tools schema）：58 个工具的 description
+  // 里没有这类措辞 —— 这一支当前命中 0，属于空转兜底，防宿主升级后把文案挪进 description。
+  // 命中 0 时返回原对象，没有副作用。只改 description，不动 name / parameters。
+  let tools = assembly.tools
+  if (config.stripTools !== false && Array.isArray(tools)) {
+    tools = tools.map((tool) => {
+      const got = applyRules(String(tool.description ?? ''), rules, 'tools')
+      hits += got.hits
+      return got.text === tool.description ? tool : { ...tool, description: got.text }
+    })
+  }
+
   if (hits && config.verbose) console.log(`[armor-lite] rewrote ${hits} phrase(s)`)
-  return { ...assembly, sections, contexts }
+  return { ...assembly, sections, contexts, tools }
 }
 
-// ── 破甲开关：进程内即时生效 + 落盘持久化 ────────────────────────────────
-function loadArmed() {
+// ── 三个开关：进程内即时生效 + 落盘持久化 ────────────────────────────────
+//   armed    破甲总开关（人设/规则段 + 组装后改写）
+//   recover  拒答自动恢复
+//   continue 空转续写（只在 reason.kind === 'max-tokens' 时补话）
+// 旧版 state.json 只有 armed 一个键，缺的字段一律按「开」处理，向后兼容。
+function loadState() {
   try {
     const raw = JSON.parse(fs.readFileSync(stateFile(), 'utf8'))
-    return raw.armed !== false
+    return {
+      armed: raw.armed !== false,
+      recover: raw.recover !== false,
+      continue: raw.continue !== false,
+    }
   } catch {
-    return true
+    return { armed: true, recover: true, continue: true }
   }
 }
 
-function saveArmed(armed) {
+function saveState(state) {
   try {
     fs.mkdirSync(armorDir(), { recursive: true })
-    fs.writeFileSync(
-      stateFile(),
-      `${JSON.stringify({ armed, updatedAt: new Date().toISOString() }, null, 2)}\n`,
-      'utf8',
-    )
+    const body = `${JSON.stringify({
+      armed: state.armed,
+      recover: state.recover,
+      continue: state.continue,
+      updatedAt: new Date().toISOString(),
+    }, null, 2)}\n`
+    // 先写临时文件再改名：半截 JSON 会让下次 loadState 整个回落「全开」，
+    // 对破甲插件来说那等于悄悄把破甲打开 —— 代价比多一次 rename 大得多。
+    const tmp = `${stateFile()}.tmp`
+    fs.writeFileSync(tmp, body, 'utf8')
+    fs.renameSync(tmp, stateFile())
     return true
   } catch {
     return false
+  }
+}
+
+/** 与 refusal-recover.js 内的 clamp 同规则：面板显示的就是真正生效的上限。 */
+function clampCount(value, fallback, max) {
+  const n = Number(value)
+  if (!Number.isFinite(n)) return fallback
+  return Math.max(0, Math.min(max, Math.trunc(n)))
+}
+
+/** 硬停白名单：接受字符串（当正则源）或 RegExp；空 / 非数组 / 写坏了都回落到 refusal-recover.js 的默认。 */
+function normalizeHardStop(list) {
+  if (!Array.isArray(list) || !list.length) return null
+  try {
+    return list.map((entry, i) => {
+      if (entry instanceof RegExp) return entry
+      if (typeof entry === 'string') return new RegExp(entry, 'u')
+      throw new TypeError(`hardStopPatterns[${i}] 需要字符串或 RegExp`)
+    })
+  } catch (error) {
+    // 一个坏正则不能让整个插件加载失败 —— 那等于破甲全线静默失效
+    console.log(`[armor-lite] hardStopPatterns 配置有问题，回落内置硬停表：${String((error && error.message) || error)}`)
+    return null
   }
 }
 
@@ -183,7 +258,8 @@ function mountApi(hostCtx, state, slots, config, log) {
     let raw = ''
     req.on('data', (chunk) => {
       raw += chunk
-      if (raw.length > 4 * 1024 * 1024) req.destroy()
+      // destroy 之后必须自己 resolve —— 否则 error 事件之外的路径会让这个请求悬挂
+      if (raw.length > 4 * 1024 * 1024) { req.destroy(); resolve(null) }
     })
     req.on('end', () => { try { resolve(JSON.parse(raw || '{}')) } catch { resolve(null) } })
     req.on('error', () => resolve(null))
@@ -219,8 +295,12 @@ function mountApi(hostCtx, state, slots, config, log) {
       if (req.method !== 'GET') return sendJson(res, 405, { error: 'GET only' })
       sendJson(res, 200, {
         armed: state.armed,
+        recover: state.recover,
+        continue: state.continue,
         home: armorDir(),
         watchIntervalMs: config.watchIntervalMs,
+        recoverMax: clampCount(config.refusalRecoverMax, 2, 5),
+        continueMax: clampCount(config.autoContinueMax, 3, 20),
         persona: describe(slotOf('persona')),
         rules: describe(slotOf('rules')),
       })
@@ -253,12 +333,21 @@ function mountApi(hostCtx, state, slots, config, log) {
       if (req.method !== 'POST') return sendJson(res, 405, { error: 'POST only' })
       const body = await readJson(req)
       if (!body || typeof body.enabled !== 'boolean') {
-        return sendJson(res, 400, { error: '需要 { enabled: boolean }' })
+        return sendJson(res, 400, { error: '需要 { enabled: boolean, key?: "armed"|"recover"|"continue" }' })
       }
-      state.armed = body.enabled
-      const persisted = saveArmed(state.armed)
-      log(`armed -> ${state.armed} (persisted=${persisted})`)
-      sendJson(res, 200, { ok: true, armed: state.armed, persisted })
+      // key 省略 = armed，旧前端调用照旧能用
+      const key = TOGGLE_KEYS.includes(body.key) ? body.key : 'armed'
+      state[key] = body.enabled
+      const persisted = saveState(state)
+      log(`${key} -> ${state[key]} (persisted=${persisted})`)
+      sendJson(res, 200, {
+        ok: true,
+        key,
+        armed: state.armed,
+        recover: state.recover,
+        continue: state.continue,
+        persisted,
+      })
     }],
   ]
 
@@ -280,7 +369,7 @@ export function apply(ctx, rawConfig) {
   if (config.enabled === false) return
   const log = (...args) => { if (config.verbose) console.log('[armor-lite]', ...args) }
 
-  const state = { armed: loadArmed() }
+  const state = loadState()
 
   const slots = SECTION_SPECS.map((spec) => {
     const inline = typeof config[spec.key] === 'string' && config[spec.key].trim()
@@ -307,23 +396,38 @@ export function apply(ctx, rawConfig) {
 
   // 3) 组装后改写：global + prepend = 最外层监听器，拥有最后一句话权。
   //    破甲关掉时原样返回、什么都不动 = 原版行为。
-  const rules = Array.isArray(config.stripRules) && config.stripRules.length
-    ? normalizeRules(config.stripRules)
-    : DEFAULT_STRIP_RULES
+  const rules = (() => {
+    if (!Array.isArray(config.stripRules) || !config.stripRules.length) return DEFAULT_STRIP_RULES
+    try {
+      return normalizeRules(config.stripRules)
+    } catch (error) {
+      // 同上：坏配置回落内置表，不让插件加载失败
+      console.log(`[armor-lite] stripRules 配置有问题，回落内置改写表：${String((error && error.message) || error)}`)
+      return DEFAULT_STRIP_RULES
+    }
+  })()
   if (config.strip !== false) {
     ctx.on('system-prompt/assemble', async (assembly, _context, next) => {
       const done = typeof next === 'function' ? await next() : assembly
       if (!state.armed) return done
-      return rewrite(done, rules, config)
+      try {
+        return rewrite(done, rules, config)
+      } catch (error) {
+        // 改写表里若塞了会抛的 replace 函数，不能连带掀掉这次组装（整个 turn 会变 error）
+        console.log(`[armor-lite] 组装后改写失败，本次原样返回：${String((error && error.message) || error)}`)
+        return done
+      }
     }, { global: true, prepend: true })
   }
 
-  // 4) 热更新：轮询而非 fs.watch —— 覆盖「文件还不存在 → 被创建」的情况
-  const watched = slots.filter((slot) => !slot.inline)
-  if (config.watch !== false && watched.length) {
+  // 4) 热更新：轮询而非 fs.watch —— 覆盖「文件还不存在 → 被创建」的情况。
+  //    内联与否在每个 tick 现判、不在启动时固定：面板保存会把 slot.inline 置 false，
+  //    那一刻起它就该进轮询，否则「面板存过之后再手改文件」读不到。
+  if (config.watch !== false) {
     ctx.effect(() => {
       const timer = setInterval(() => {
-        for (const slot of watched) {
+        for (const slot of slots) {
+          if (slot.inline) continue
           try {
             const next = fs.readFileSync(slot.watchFile, 'utf8')
             if (next !== slot.text) {
@@ -347,5 +451,25 @@ export function apply(ctx, rawConfig) {
     )
   })
 
-  log(`armed (armed=${state.armed}, sections=${slots.length}, strip=${config.strip !== false}, rules=${rules.length}, drop=${(config.dropSections ?? []).length})`)
+  // 6) 拒答自动恢复 / 空转续写：纯事件层，不碰提示词组装。
+  //    判据与补话见 refusal-recover.js 顶部注释（都对着本机源码核过）。
+  //    三个开关（armed / recover / continue）任一关掉即停。面板改动立即生效；
+  //    直接改 state.json 要重启才读得到（state 只在插件加载时读一次）。
+  if (config.refusalRecover !== false || config.autoContinue !== false) {
+    ctx.effect(() => installRefusalRecover(ctx, {
+      enabled: () => state.armed && state.recover && config.refusalRecover !== false,
+      continueEnabled: () => state.armed && state.continue && config.autoContinue !== false,
+      maxPerTurn: config.refusalRecoverMax,
+      chainMax: config.refusalRecoverChainMax,
+      continueMax: config.autoContinueMax,
+      headLimit: config.refusalRecoverHeadLimit,
+      recoverText: config.refusalRecoverText,
+      continueText: config.autoContinueText,
+      hardStop: normalizeHardStop(config.hardStopPatterns),
+      skipSubagents: config.skipSubagentRecover !== false,
+      log,
+    }))
+  }
+
+  log(`armed (armed=${state.armed}, recover=${state.recover}, continue=${state.continue}, sections=${slots.length}, strip=${config.strip !== false}, rules=${rules.length}, drop=${(config.dropSections ?? []).length})`)
 }
