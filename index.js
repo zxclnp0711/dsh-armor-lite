@@ -595,6 +595,33 @@ function mountApi(hostCtx, state, slots, config, log, active) {
     }
   }
 
+  /**
+   * 把生效指针切到 id 并立即同步 slot（不等轮询）。
+   * /activate 与 /save(activate:true) 共用 —— 写完盘再调它，会重新从文件读一遍，
+   * 所以「写文件」和「改内存」不会各读一次旧内容。
+   */
+  const switchActive = (id) => {
+    active.persona = id
+    const persisted = saveActive(config, active)
+    const got = readPersona(config, active)
+    const slot = slotOf('persona')
+    if (slot) {
+      slot.ownText = got.ownText
+      slot.text = got.text
+      slot.watchFile = got.file
+      slot.src = got.src
+      slot.kind = got.kind
+      slot.id = got.id
+      slot.requested = got.requested
+      slot.fallbackFrom = got.fallbackFrom
+      slot.baseFile = got.baseFile
+      slot.baseBytes = got.baseBytes
+      // 内联时 readPersona 返回的就是内联值：指针变了但注入内容没变
+      slot.inline = got.inline
+    }
+    return { persisted, got, slot }
+  }
+
   const routes = [
     ['/dsh-armor/api/state', async (req, res) => {
       if (req.method !== 'GET') return sendJson(res, 405, { error: 'GET only' })
@@ -626,28 +653,38 @@ function mountApi(hostCtx, state, slots, config, log, active) {
       const slot = slotOf(body.which)
       if (!slot) return sendJson(res, 400, { error: `未知目标 ${JSON.stringify(body.which)}` })
 
-      // 写哪一份：显式 id（库里那一份）→ 该段当前绑定的文件 → 内联时回落到常规路径。
+      // 写哪一份：显式 id（库里那一份，或 legacy）→ 该段当前绑定的文件 → 内联时回落到常规路径。
       // 内联 persona 的 slot.watchFile 是空串，直接拼会得到 "<cwd>.<pid>...tmp" 再 rename 到 ""，
       // 那是本文件里唯一能写到 personasDir 之外的路径。
       const explicitId = typeof body.id === 'string' && body.id ? body.id : ''
-      if (explicitId && !slot.spec.compose) return sendJson(res, 400, { error: `${body.which} 段不支持 id` })
-      if (explicitId && !isValidPersonaId(explicitId)) return sendJson(res, 400, { error: `非法人设 id：${JSON.stringify(explicitId)}` })
-      // 显式 id 必须已存在：否则递归 mkdir 会凭空造出一个没有 meta.json 的"人设"目录
-      if (explicitId && !fs.existsSync(personaFileOf(config, explicitId))) {
+      const isPersona = Boolean(slot.spec.compose)
+      if (explicitId && !isPersona) return sendJson(res, 400, { error: `${body.which} 段不支持 id` })
+      if (explicitId && explicitId !== LEGACY_ID && !isValidPersonaId(explicitId)) {
+        return sendJson(res, 400, { error: `非法人设 id：${JSON.stringify(explicitId)}` })
+      }
+      // 显式 id 必须已存在：否则递归 mkdir 会凭空造出一个没有 meta.json 的"人设"目录。
+      // legacy 例外 —— 那份文件允许被首次创建。
+      if (explicitId && explicitId !== LEGACY_ID && !fs.existsSync(personaFileOf(config, explicitId))) {
         return sendJson(res, 404, { error: `人设不存在：${explicitId}` })
       }
-      const file = explicitId
-        ? personaFileOf(config, explicitId)
-        : (slot.watchFile || path.join(armorDir(), slot.spec.defaultFile))
+      const file = explicitId === LEGACY_ID
+        ? path.join(armorDir(), 'persona.md')
+        : explicitId
+          ? personaFileOf(config, explicitId)
+          : (slot.watchFile || path.join(armorDir(), slot.spec.defaultFile))
+
+      // activate:true = 面板「保存」的语义：写盘 + 把这份设为生效（一次做完）,
+      // 中间不留"写完了但没生效"的状态。缺省保持旧行为：只有写的是当前生效那份才动内存。
+      const wantsActivate = isPersona && body.activate === true && explicitId !== ''
 
       // 这次写入是否作用于「当前正在注入的那份」。写别的份时绝不能动内存 ——
       // 否则下一次请求会当场换成另一份人设（库→非库切换还会连带丢掉 _base 拼接）。
-      const writesActive = explicitId ? explicitId === (slot.inline ? '' : slot.id) : !slot.inline
-      const reason = writesActive
-        ? ''
-        : explicitId
-          ? `写的是库里的另一份（${explicitId}），当前注入的仍是 ${slot.inline ? 'YAML 内联值' : (slot.id || 'legacy')}`
-          : 'YAML 内联 config.persona 优先，保存文件不改变当前注入内容'
+      const writesActive = explicitId
+        ? explicitId === (slot.inline ? '' : (slot.id || LEGACY_ID))
+        : !slot.inline
+      const skipReason = explicitId
+        ? `写的是库里的另一份（${explicitId}），当前注入的仍是 ${slot.inline ? 'YAML 内联值' : (slot.id || LEGACY_ID)}`
+        : 'YAML 内联 config.persona 优先，保存文件不改变当前注入内容'
 
       try {
         fs.mkdirSync(path.dirname(file), { recursive: true })
@@ -655,12 +692,19 @@ function mountApi(hostCtx, state, slots, config, log, active) {
         const tmp = tmpNameOf(file)
         fs.writeFileSync(tmp, body.text, 'utf8')
         fs.renameSync(tmp, file)
-        if (writesActive) {
+
+        let effective = false
+        let reason = ''
+        if (wantsActivate) {
+          const committed = switchActive(explicitId)
+          effective = true
+          reason = committed.persisted ? '' : 'active.json 没写下去（重启后会回到旧值）'
+        } else if (writesActive) {
           // 立刻生效，不等下一次轮询；并让位给文件（内联值不再优先）
           slot.inline = false
           slot.src = file
           slot.watchFile = file
-          if (slot.spec.compose) {
+          if (isPersona) {
             slot.ownText = body.text
             // 只有库模式才拼 _base：legacy 下保存必须保持与旧版逐字节相同的输出
             const base = slot.kind === 'library' ? readBaseFragment(config) : { text: '', file: '' }
@@ -670,10 +714,21 @@ function mountApi(hostCtx, state, slots, config, log, active) {
           } else {
             slot.text = body.text
           }
+          effective = true
+        } else {
+          reason = skipReason
         }
+
         const bytes = Buffer.byteLength(body.text, 'utf8')
-        log(`${slot.spec.section} saved <- ${file} (${bytes} bytes, effective=${writesActive})`)
-        sendJson(res, 200, { ok: true, path: file, bytes, effective: writesActive, ...(writesActive ? {} : { reason }) })
+        log(`${slot.spec.section} saved <- ${file} (${bytes} bytes, effective=${effective}, activate=${wantsActivate})`)
+        sendJson(res, 200, {
+          ok: true,
+          path: file,
+          bytes,
+          effective,
+          ...(effective ? {} : { reason }),
+          ...(wantsActivate ? { active: { persona: active.persona } } : {}),
+        })
       } catch (e) {
         sendJson(res, 500, { error: String((e && e.message) || e) })
       }
@@ -727,24 +782,9 @@ function mountApi(hostCtx, state, slots, config, log, active) {
       if (id !== LEGACY_ID && !fs.existsSync(personaFileOf(config, id))) {
         return sendJson(res, 404, { error: `人设不存在：${id}` })
       }
-      active.persona = id
-      const persisted = saveActive(config, active)
-      const got = readPersona(config, active)
-      const slot = slotOf('persona')
-      if (slot) {
-        slot.ownText = got.ownText
-        slot.text = got.text
-        slot.watchFile = got.file
-        slot.src = got.src
-        slot.kind = got.kind
-        slot.id = got.id
-        slot.requested = got.requested
-        slot.fallbackFrom = got.fallbackFrom
-        slot.baseFile = got.baseFile
-        slot.baseBytes = got.baseBytes
-        // 内联时 readPersona 返回的就是内联值：指针变了但注入内容没变，别报"已生效"
-        slot.inline = got.inline
-      }
+      const committed = switchActive(id)
+      const slot = committed.slot
+      const persisted = committed.persisted
       // 「生效」= 注入内容确实来自被切的那一份。内联覆盖 / 指针目标缺失时都不算生效
       const effective = slot
         ? (slot.inline
@@ -758,6 +798,47 @@ function mountApi(hostCtx, state, slots, config, log, active) {
             : (slot && slot.fallbackFrom ? `${slot.fallbackFrom} 读不到，实际注入的是 ${slot.kind}` : '未生效'))
       log(`active.persona -> ${id} (persisted=${persisted}, effective=${effective})`)
       sendJson(res, 200, { ok: true, active: { persona: id }, persisted, effective, persona: describe(slot), ...(effective ? {} : { reason }) })
+    }],
+
+    // 只读预览：拿某个 id 的角色正文，**不碰指针**。
+    // 面板下拉的语义是「选中=预览，保存才生效」，所以需要一个不改任何状态的读接口。
+    ['/dsh-armor/api/persona', async (req, res) => {
+      if (req.method !== 'GET') return sendJson(res, 405, { error: 'GET only' })
+      let id = ''
+      try {
+        id = new URL(String(req.url ?? '/'), 'http://127.0.0.1').searchParams.get('id') ?? ''
+      } catch { /* url 坏了就当没给 */ }
+      if (id !== LEGACY_ID && !isValidPersonaId(id)) {
+        return sendJson(res, 400, { error: `需要 ?id=<人设 id | legacy>（实得 ${JSON.stringify(id)}）` })
+      }
+      const file = id === LEGACY_ID ? path.join(armorDir(), 'persona.md') : personaFileOf(config, id)
+      let text = null
+      try { text = fs.readFileSync(file, 'utf8') } catch { text = null }
+      if (text === null) return sendJson(res, 404, { error: `人设不存在：${id}` })
+      const base = id === LEGACY_ID ? { text: '', file: '' } : readBaseFragment(config)
+      const meta = readCatalog(config).get(id) ?? null
+      const total = base.text.trim() ? `${base.text.trimEnd()}\n\n${text.trimEnd()}\n` : text
+      sendJson(res, 200, {
+        id,
+        path: file,
+        text,
+        bytes: Buffer.byteLength(text, 'utf8'),
+        kind: id === LEGACY_ID ? LEGACY_ID : 'library',
+        meta: meta
+          ? {
+              name: typeof meta.displayName === 'string' ? meta.displayName : id,
+              tagline: typeof meta.tagline === 'string' ? meta.tagline : '',
+              emoji: typeof meta.emoji === 'string' ? meta.emoji : '',
+              accent: typeof meta.accent === 'string' ? meta.accent : '',
+              tags: Array.isArray(meta.tags) ? meta.tags : [],
+            }
+          : null,
+        composed: {
+          baseFile: base.file,
+          baseBytes: Buffer.byteLength(base.text, 'utf8'),
+          totalBytes: Buffer.byteLength(total, 'utf8'),
+        },
+      })
     }],
 
     ['/dsh-armor/api/persona/create', async (req, res) => {

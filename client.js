@@ -140,12 +140,21 @@ window.__ModuleLoader__.load({
     }
 
     // 人设库选择器。刻意不用 window.prompt —— Electron 渲染进程里它不可用，改成内联小表单。
-    function PersonaPicker({ data, busy, onActivate, onCreate, onRemove }) {
+    // 点下拉 = 只预览（把该人设的正文载入编辑器），点「保存」才写盘并切过去。
+    // 所以这里有两个 id：selected（面板正在看/编辑的那份）与 activeId（服务端真正在注入的那份）。
+    function PersonaPicker({ data, busy, selected, onChoose, onCreate, onRemove }) {
       const [open, setOpen] = React.useState(false)
       const [draft, setDraft] = React.useState('')
       const [manage, setManage] = React.useState(false)
-      const current = (data.active && data.active.persona) || 'legacy'
       const available = (data.personas && data.personas.available) || []
+      const activeId = (data.active && data.active.persona) || 'legacy'
+      const current = selected || activeId
+      const pendingSwitch = current !== activeId
+      const labelOf = (id) => {
+        if (id === 'legacy') return 'legacy（armor\\persona.md）'
+        const p = available.find((x) => x.id === id)
+        return p ? `${p.emoji ? `${p.emoji} ` : ''}${p.name}` : id
+      }
       const options = [{ id: 'legacy', name: 'legacy · 直读 armor\\persona.md' }]
         .concat(available.map((p) => ({
           id: p.id,
@@ -156,13 +165,15 @@ window.__ModuleLoader__.load({
       return h('section', { style: { marginTop: 26 } },
         h('div', { style: { display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap' } },
           h('h3', { style: { margin: 0, fontSize: 15, fontWeight: 700, color: T.label } }, '人设库'),
-          h('span', { style: { fontSize: 12, color: T.label2 } },
-            '选一份注入；legacy = 直读 armor\\persona.md'),
+          h('span', { style: { fontSize: 12, color: pendingSwitch ? T.warn : T.label2 } },
+            pendingSwitch
+              ? `⚠ 已载入 ${labelOf(current)} 预览 —— 点下面「保存」才写入并切过去`
+              : '选中只预览；点「保存」才落盘并生效'),
           h('span', { style: { flex: 1 } }),
           h('select', {
             value: current,
             disabled: !!busy,
-            onChange: (e) => onActivate(e.target.value),
+            onChange: (e) => onChoose(e.target.value),
             style: {
               padding: '6px 10px', borderRadius: 8, fontSize: 13, fontWeight: 600,
               fontFamily: 'inherit', cursor: busy ? 'wait' : 'pointer',
@@ -194,8 +205,8 @@ window.__ModuleLoader__.load({
                 }, p.id),
                 h('span', { style: { fontSize: 11.5, color: T.label2 } }, `${p.bytes}B`),
                 h('span', { style: { flex: 1 } }),
-                p.id === current
-                  ? h('span', { style: { fontSize: 11.5, color: T.label2 } }, '使用中')
+                p.id === activeId
+                  ? h('span', { style: { fontSize: 11.5, color: T.label2 } }, '生效中')
                   : h(Btn, { onClick: () => onRemove(p.id), disabled: !!busy }, '移走'),
               )),
             )
@@ -240,8 +251,12 @@ window.__ModuleLoader__.load({
       const [persona, setPersona] = React.useState('')
       const [rules, setRules] = React.useState('')
       const [dirty, setDirty] = React.useState({ persona: false, rules: false })
-      // 有未保存草稿时切换人设要二次确认；这里记「待确认的目标 id」
-      const [pendingActivate, setPendingActivate] = React.useState('')
+      // 面板正在看/编辑的那份人设：点下拉只改它，点「保存」才写盘并切生效
+      const [selected, setSelected] = React.useState('')
+      // 有未保存草稿时切换预览要二次确认；这里记「待确认的目标 id」
+      const [pendingChoose, setPendingChoose] = React.useState('')
+      // 预览别的人设时，编辑器里的内容与 data.persona 不是同一份 —— 元信息要用这份
+      const [previewMeta, setPreviewMeta] = React.useState(null)
       const alive = React.useRef(true)
       // 体内必须重置回 true：StrictMode / dev 双调用下 cleanup 会先跑一次，
       // 只写 cleanup 会把 alive.current 永久钉成 false，面板就永远停在「读取中…」。
@@ -258,6 +273,8 @@ window.__ModuleLoader__.load({
           setData(body)
           setPersona(body.persona.text || '')
           setRules(body.rules.text || '')
+          setSelected((body.active && body.active.persona) || 'legacy')
+          setPreviewMeta(null)
           setDirty({ persona: false, rules: false })
           setNote(null)
         } catch (e) {
@@ -269,35 +286,53 @@ window.__ModuleLoader__.load({
 
       React.useEffect(() => { void load() }, [load])
 
+      const labelOf = (id) => {
+        if (id === 'legacy') return 'legacy（armor\\persona.md）'
+        const list = (data && data.personas && data.personas.available) || []
+        const p = list.find((x) => x.id === id)
+        return p ? `${p.emoji ? `${p.emoji} ` : ''}${p.name}` : id
+      }
+
+      // 以服务端为准重拉一次。保存/切换之后用，不碰 note、不置 busy、不清提示。
+      const syncFromServer = async () => {
+        try {
+          const body = await call('/state')
+          if (!alive.current) return
+          setData(body)
+          setPersona(body.persona.text || '')
+          setRules(body.rules.text || '')
+          setSelected((body.active && body.active.persona) || 'legacy')
+          setPreviewMeta(null)
+          setDirty({ persona: false, rules: false })
+        } catch { /* 拉不到就保持当前显示 */ }
+      }
+
       const save = async (which) => {
         setBusy('save')
         try {
           const text = which === 'persona' ? persona : rules
-          const body = await postJson('/save', { which, text })
+          // 人设段：保存 = 写入当前预览的这份 + 把它设为生效（面板「保存」的语义）。
+          // rules 段没有多份，维持旧行为。
+          const payload = { which, text }
+          if (which === 'persona' && selected) {
+            payload.id = selected
+            payload.activate = true
+          }
+          const body = await postJson('/save', payload)
           if (!alive.current) return
           setDirty((d) => ({ ...d, [which]: false }))
           if (body.effective === false) {
-            // 写成功但没生效（被 YAML 内联覆盖，或写的是库里另一份）—— 不能报「已生效」
-            setNote({ kind: 'warn', text: `已写入 ${body.path}（${body.bytes} 字节），但当前未生效：${body.reason || '非当前生效的那份'}` })
-            await refreshList()
+            // 写成功但没生效（被 YAML 内联覆盖）—— 不能报「已生效」
+            setNote({ kind: 'warn', text: `已写入 ${body.path}（${body.bytes} 字节），但当前未生效：${body.reason || '被覆盖'}` })
           } else {
-            setNote({ kind: 'ok', text: `已保存 ${body.bytes} 字节 → ${body.path}（约 2 秒内对后续请求生效）` })
-            setData((s) => (s
-              ? {
-                  ...s,
-                  [which]: {
-                    ...s[which],
-                    text,
-                    bytes: body.bytes,
-                    source: body.path,
-                    persisted: true,
-                    effective: true,
-                    requested: '',
-                    fallbackFrom: '',
-                  },
-                }
-              : s))
+            setNote({
+              kind: 'ok',
+              text: which === 'persona'
+                ? `已保存 ${body.bytes} 字节 → ${body.path}，并切到 ${labelOf(selected)}`
+                : `已保存 ${body.bytes} 字节 → ${body.path}（约 2 秒内对后续请求生效）`,
+            })
           }
+          await syncFromServer()
         } catch (e) {
           if (alive.current) setNote({ kind: 'err', text: `保存失败：${e.message}` })
         } finally {
@@ -319,39 +354,37 @@ window.__ModuleLoader__.load({
         }
       }
 
-      const activate = async (id) => {
-        setBusy('activate')
+      // 点下拉 = 只预览：把该人设的正文载入编辑器，**不动 active.json、不动注入**。
+      // 真正切生效由「保存」负责（/save 带 activate:true，写盘 + 挪指针一次做完）。
+      const choosePersona = async (id) => {
+        setBusy('choose')
         try {
-          const body = await postJson('/activate', { persona: id })
+          const body = await call(`/persona?id=${encodeURIComponent(id)}`)
           if (!alive.current) return
-          setPendingActivate('')
-          setData((s) => (s ? { ...s, active: body.active, persona: body.persona } : s))
-          setPersona((body.persona && body.persona.text) || '')
+          setPendingChoose('')
+          setSelected(id)
+          setPersona(body.text || '')
+          setPreviewMeta(body)
           setDirty((d) => ({ ...d, persona: false }))
-          const label = id === 'legacy' ? 'legacy（直读 armor\\persona.md）' : id
-          if (body.effective === false) {
-            setNote({ kind: 'warn', text: `指针已切到 ${label}，但当前未生效：${body.reason || '被覆盖'}` })
-          } else if (body.persisted === false) {
-            setNote({ kind: 'warn', text: `已切到 ${label} 并当场生效，但 active.json 没写下去（重启后会回到旧值）。` })
-          } else {
-            setNote({ kind: 'ok', text: `已切到 ${label}，下一次请求即生效。` })
-          }
-          await refreshList()
+          const activeId = (data && data.active && data.active.persona) || 'legacy'
+          setNote(id === activeId
+            ? { kind: 'ok', text: `${labelOf(id)} 就是当前生效的那份，改完点「保存」写回。` }
+            : { kind: 'warn', text: `已载入 ${labelOf(id)} 预览（尚未生效）。点「保存」才会写入并切过去。` })
         } catch (e) {
-          if (alive.current) setNote({ kind: 'err', text: `切换失败：${e.message}` })
+          if (alive.current) setNote({ kind: 'err', text: `读取失败：${e.message}` })
         } finally {
           if (alive.current) setBusy('')
         }
       }
 
-      // 切换会覆盖编辑器内容：有未保存草稿时要求再选一次确认
-      const requestActivate = (id) => {
-        if (dirty.persona && pendingActivate !== id) {
-          setPendingActivate(id)
-          setNote({ kind: 'warn', text: `人设正文有未保存的修改。再选一次 ${id} 就切换（未保存内容会丢）。` })
+      // 切预览会覆盖编辑器内容：有未保存草稿时要求再选一次确认
+      const requestChoose = (id) => {
+        if (dirty.persona && pendingChoose !== id) {
+          setPendingChoose(id)
+          setNote({ kind: 'warn', text: `人设正文有未保存的修改。再选一次 ${id} 就切换预览（未保存内容会丢）。` })
           return
         }
-        void activate(id)
+        void choosePersona(id)
       }
 
       const createPersona = async (id) => {
@@ -359,8 +392,12 @@ window.__ModuleLoader__.load({
         try {
           const body = await postJson('/persona/create', { id })
           if (!alive.current) return false
-          setNote({ kind: 'ok', text: `已建 ${body.file}（来源 ${body.source}）。填好人设后在上方下拉里选它。` })
           await refreshList()
+          // 新建完直接载入预览，省掉"再点一次下拉"这一步
+          await choosePersona(id)
+          if (alive.current) {
+            setNote({ kind: 'ok', text: `已建 ${body.file}（来源 ${body.source}），并载入预览。填好后点「保存」写入并切过去。` })
+          }
           return true
         } catch (e) {
           if (alive.current) setNote({ kind: 'err', text: `新建失败：${e.message}` })
@@ -452,7 +489,14 @@ window.__ModuleLoader__.load({
         }
         return parts.join(' · ')
       }
-      const personaMeta = metaOf(data.persona)
+      // 预览别的人设时，编辑器里的内容不是 data.persona 那一份 —— 元信息要跟着选中项走
+      const personaMeta = (previewMeta && previewMeta.id === selected)
+        ? `预览：${previewMeta.path || previewMeta.id} · ${previewMeta.bytes} 字节`
+          + (previewMeta.composed && previewMeta.composed.baseBytes > 0
+              ? ` · 保存后注入 = _base ${previewMeta.composed.baseBytes} 字节 + 本文件 → 合计 ${previewMeta.composed.totalBytes} 字节`
+              : '')
+          + ' · 尚未生效'
+        : metaOf(data.persona)
       const rulesMeta = metaOf(data.rules)
 
       return wrap([
@@ -513,8 +557,8 @@ window.__ModuleLoader__.load({
 
         h(PersonaPicker, {
           key: 'personas',
-          data, busy,
-          onActivate: (id) => requestActivate(id),
+          data, busy, selected,
+          onChoose: (id) => requestChoose(id),
           onCreate: (id) => createPersona(id),
           onRemove: (id) => void removePersona(id),
         }),
@@ -522,9 +566,11 @@ window.__ModuleLoader__.load({
         h(Editor, {
           key: 'persona',
           title: '人设正文',
-          hint: (data.persona && data.persona.kind === 'library')
-            ? `库里这一份（保存写它；_base 不在这里）`
-            : '段 armor:persona，排在最前，永远先于第一方指导',
+          hint: selected && selected !== ((data.active && data.active.persona) || 'legacy')
+            ? `正在预览 ${labelOf(selected)}（尚未生效）—— 点「保存」才切过去`
+            : (data.persona && data.persona.kind === 'library'
+                ? '库里这一份（保存写它；_base 不在这里）'
+                : '段 armor:persona，排在最前，永远先于第一方指导'),
           value: persona, meta: personaMeta, dirty: dirty.persona, busy,
           onChange: (v) => { setPersona(v); setDirty((d) => ({ ...d, persona: true })) },
           onSave: () => void save('persona'),

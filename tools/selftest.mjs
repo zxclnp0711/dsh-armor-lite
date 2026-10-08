@@ -35,10 +35,11 @@ const ok = (cond, label) => {
 // ── HTTP 桥的调用辅助（人设库那几条路由要按真实请求形状测）──────────────────
 //  mountApi 注册的 handler 是 `(req,res) => { Promise.resolve(handler(req,res)).catch(...) }`
 //  —— 箭头函数体没有 return，所以不能 await 它，只能等 res.body 被填上。
-function fakeReq(method, body) {
+function fakeReq(method, body, url) {
   const handlers = {}
   const req = {
     method,
+    url,
     on(event, cb) { (handlers[event] ||= []).push(cb); return req },
     destroy() {},
   }
@@ -57,11 +58,11 @@ function fakeRes() {
     end(body) { this.body = body },
   }
 }
-async function callRoute(registered, routePath, method = 'GET', body) {
+async function callRoute(registered, routePath, method = 'GET', body, query = '') {
   const route = registered.find((r) => r.path === routePath)
   if (!route) return { code: 0, json: null, missing: true }
   const res = fakeRes()
-  route.handler(fakeReq(method, body), res)
+  route.handler(fakeReq(method, body, `${routePath}${query}`), res)
   for (let i = 0; i < 200 && res.body === ''; i += 1) await new Promise((r) => setTimeout(r, 2))
   let json = null
   try { json = JSON.parse(res.body) } catch { /* 非 JSON */ }
@@ -152,7 +153,7 @@ ok(m.sections[0].name === 'armor:persona' && m.sections[0].order === -1500, 'arm
 ok(m.sections[1].name === 'armor:rules' && m.sections[1].order === -1400, 'armor:rules @ -1400')
 ok(typeof m.listeners.get('system-prompt/assemble') === 'function', '挂了 system-prompt/assemble')
 ok(typeof m.listeners.get('agent/status') === 'function', '挂了 agent/status')
-ok(m.registered.length === 7, `HTTP 桥注册 7 条路由（实得 ${m.registered.length}）`)
+ok(m.registered.length === 8, `HTTP 桥注册 8 条路由（实得 ${m.registered.length}）`)
 
 console.log('\n[3] 事件驱动')
 const status = m.listeners.get('agent/status')
@@ -469,6 +470,48 @@ fs.writeFileSync(activeFile, JSON.stringify({ schema: 1, persona: 'legacy' }), '
 await new Promise((r) => setTimeout(r, 300))
 const t15 = m15.sections[0].text({})
 ok(t15 === fs.readFileSync(legacyFile, 'utf8'), `切回 legacy 生效且不拼 _base（实得 ${JSON.stringify(t15)}）`)
+
+// ── 新的面板语义：选中=预览，保存=生效 ────────────────────────────────────
+console.log('\n[20] 只读预览接口（不动指针、不动注入）')
+fs.writeFileSync(legacyFile, 'LEGACY-PREVIEW\n', 'utf8')
+fs.writeFileSync(path.join(personasDir, 'beta', 'persona.md'), 'BETA-BODY\n', 'utf8')
+fs.writeFileSync(activeFile, JSON.stringify({ schema: 1, persona: 'legacy' }), 'utf8')
+const m16 = makeCtx()
+mod.apply(m16.ctx, {})
+
+const pv = await callRoute(m16.registered, '/dsh-armor/api/persona', 'GET', undefined, '?id=beta')
+ok(pv.code === 200 && pv.json.text === 'BETA-BODY\n', '/persona?id=beta 返回正文')
+ok(pv.json.kind === 'library' && pv.json.composed.baseBytes === 14, '/persona 报出 kind 与 _base 体积')
+ok(pv.json.path === path.join(personasDir, 'beta', 'persona.md'), '/persona 报出实际路径')
+ok(JSON.parse(fs.readFileSync(activeFile, 'utf8')).persona === 'legacy', '预览不改指针')
+ok(m16.sections[0].text({}) === 'LEGACY-PREVIEW\n', '预览不改注入内容')
+
+const pvLegacy = await callRoute(m16.registered, '/dsh-armor/api/persona', 'GET', undefined, '?id=legacy')
+ok(pvLegacy.code === 200 && pvLegacy.json.text === 'LEGACY-PREVIEW\n', '/persona?id=legacy 可读')
+ok((await callRoute(m16.registered, '/dsh-armor/api/persona', 'GET', undefined, '?id=ghost')).code === 404, '不存在 → 404')
+ok((await callRoute(m16.registered, '/dsh-armor/api/persona', 'GET', undefined, '?id=../evil')).code === 400, '非法 id → 400')
+ok((await callRoute(m16.registered, '/dsh-armor/api/persona', 'GET')).code === 400, '缺 id → 400')
+
+console.log('\n[21] 保存即生效（面板「保存」的语义）')
+// 预览 beta 后保存 → 写文件 + 挪指针 + 同步内存，一次做完
+const svAct = await callRoute(m16.registered, '/dsh-armor/api/save', 'POST', { which: 'persona', id: 'beta', text: 'BETA-NEW\n', activate: true })
+ok(svAct.code === 200 && svAct.json.effective === true, '/save + activate → effective:true')
+ok(fs.readFileSync(path.join(personasDir, 'beta', 'persona.md'), 'utf8') === 'BETA-NEW\n', '文件已写入')
+ok(svAct.json.active && svAct.json.active.persona === 'beta', '响应报出新指针')
+ok(JSON.parse(fs.readFileSync(activeFile, 'utf8')).persona === 'beta', '指针已落盘')
+ok(m16.sections[0].text({}) === 'BASE-A\nBASE-B\n\nBETA-NEW\n', '内存已同步（注入 = _base + 新内容）')
+
+// 再切回 legacy：也要能「保存即生效」，且 legacy 那份允许被首次创建
+const svLegacy = await callRoute(m16.registered, '/dsh-armor/api/save', 'POST', { which: 'persona', id: 'legacy', text: 'LEGACY-NEW\n', activate: true })
+ok(svLegacy.code === 200 && svLegacy.json.effective === true, 'id=legacy + activate → effective:true')
+ok(svLegacy.json.path === legacyFile, '写入的是 armor\\persona.md')
+ok(m16.sections[0].text({}) === 'LEGACY-NEW\n', '回到 legacy 注入（不拼 _base）')
+ok(JSON.parse(fs.readFileSync(activeFile, 'utf8')).persona === 'legacy', '指针回到 legacy')
+
+// 不带 activate 时保持旧语义：写别的份不动内存
+const svNoAct = await callRoute(m16.registered, '/dsh-armor/api/save', 'POST', { which: 'persona', id: 'beta', text: 'BETA-QUIET\n' })
+ok(svNoAct.code === 200 && svNoAct.json.effective === false, '不带 activate → 写非生效份 effective:false')
+ok(m16.sections[0].text({}) === 'LEGACY-NEW\n', '不带 activate 时不污染当前注入')
 
 console.log(`\n===== ${pass} passed, ${fail} failed =====`)
 if (fail === 0) console.log(`（测试用的临时 DSH_HOME: ${tmpHome}）`)
