@@ -1,6 +1,6 @@
 {
   "name": "dsh-armor-lite",
-  "version": "0.4.0",
+  "version": "0.4.1",
   "description": "轻量破甲：YAML 权限层 + 运行时系统提示词改写 + 多套人设库（含硬约束片段与最小插值）+ 本地规则 + 拒答恢复 + 侧栏破甲面板",
   "type": "module",
   "main": "index.js",

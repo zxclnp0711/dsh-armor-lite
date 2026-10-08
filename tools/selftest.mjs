@@ -289,6 +289,10 @@ const activeFile = path.join(armorDir, 'active.json')
 const armCtx = { agent: { session: { header: { cwd: 'D:\\FIXTURE\\CWD' } }, options: { model: 'fixture-model' } } }
 
 console.log('\n[9] legacy 直读（默认路径：不拼 _base、行为与旧版一致）')
+// _base 必须在这一组之前就存在：否则下面「legacy 不拼 _base」的断言在 _base 尚不存在时
+// 必然通过 —— 那是测不到东西的虚设断言。真正有效的是这里先把它建出来。
+fs.mkdirSync(path.join(personasDir, '_base'), { recursive: true })
+fs.writeFileSync(path.join(personasDir, '_base', 'hard-rules.md'), 'BASE-A\nBASE-B\n', 'utf8')
 const legacyPlain = '硬约束行一\n硬约束行二\n'
 fs.writeFileSync(legacyFile, legacyPlain, 'utf8')
 fs.rmSync(activeFile, { force: true })
@@ -306,7 +310,7 @@ ok(t6.includes('{{nope}}'), '插值：未知 {{nope}} 原样保留（宿主插�
 ok(t6.includes('{{HOME}}'), '插值：变量名大小写敏感，{{HOME}} 不命中')
 ok(!t6.includes('{{cwd}}') && !t6.includes('{{model}}'), '插值：已知变量已替换')
 const t6b = m6b.sections[0].text(undefined)
-ok(t6b.includes(path.sep === '\\' ? process.cwd() : process.cwd()), '插值：无 context 时 {{cwd}} 回落进程 cwd')
+ok(t6b.includes(process.cwd()), '插值：无 context 时 {{cwd}} 回落进程 cwd')
 
 console.log('\n[10] 库模式（_base 拼接 + 面板只看角色正文）')
 fs.mkdirSync(path.join(personasDir, '_base'), { recursive: true })
@@ -378,6 +382,10 @@ ok(!fs.existsSync(path.join(personasDir, 'made-by-test')), '/persona/remove 库�
 ok(fs.existsSync(rm.json.trashed), '/persona/remove 目标确实落到 trash（可还原）')
 ok((await callRoute(m9.registered, '/dsh-armor/api/persona/remove', 'POST', { id: 'legacy' })).code === 400, '/persona/remove 拒绝 legacy')
 ok((await callRoute(m9.registered, '/dsh-armor/api/persona/remove', 'POST', { id: 'ghost' })).code === 404, '/persona/remove 不存在 → 404')
+// 使用中的那份必须拒（面板改成从列表里移走非 active 项，后端这条留作兜底）
+await callRoute(m9.registered, '/dsh-armor/api/activate', 'POST', { persona: 'fixture' })
+ok((await callRoute(m9.registered, '/dsh-armor/api/persona/remove', 'POST', { id: 'fixture' })).code === 409, '/persona/remove 拒绝移走使用中的那份')
+await callRoute(m9.registered, '/dsh-armor/api/activate', 'POST', { persona: 'legacy' })
 
 console.log('\n[13] legacy 下保存仍是旧行为（不引入 _base）')
 const m9b = makeCtx()
@@ -393,6 +401,74 @@ fs.writeFileSync(activeFile, JSON.stringify({ schema: 1, persona: 'fixture' }), 
 await new Promise((r) => setTimeout(r, 300))
 const t10 = m10.sections[0].text({})
 ok(t10 === 'BASE-A\nBASE-B\n\nNEW-ROLE\n', `轮询接住 active.json 变更（实得 ${JSON.stringify(t10)}）`)
+
+// ── 回归：只读审查找出来的四条交互缺陷 ────────────────────────────────────
+//  这几条的共同点是「默认路径下看不出来」：legacy 逐字节成立、selftest 全绿，
+//  但只要动用人设库就会踩。所以每条都对着真实请求形状钉一遍。
+
+console.log('\n[15] /save 带非 active 的 id：写文件，但不改当前注入')
+fs.mkdirSync(path.join(personasDir, 'beta'), { recursive: true })
+fs.writeFileSync(path.join(personasDir, 'beta', 'persona.md'), 'BETA-OLD\n', 'utf8')
+fs.writeFileSync(legacyFile, 'LEGACY-BODY\n', 'utf8')
+fs.writeFileSync(activeFile, JSON.stringify({ schema: 1, persona: 'legacy' }), 'utf8')
+const m11 = makeCtx()
+mod.apply(m11.ctx, {})
+ok(m11.sections[0].text({}) === 'LEGACY-BODY\n', '前置：当前注入是 legacy')
+const svBeta = await callRoute(m11.registered, '/dsh-armor/api/save', 'POST', { which: 'persona', id: 'beta', text: 'BETA-NEW\n' })
+ok(svBeta.code === 200 && svBeta.json.effective === false, '/save 带非 active id → effective:false')
+ok(fs.readFileSync(path.join(personasDir, 'beta', 'persona.md'), 'utf8') === 'BETA-NEW\n', '/save 确实写进了 beta')
+ok(m11.sections[0].text({}) === 'LEGACY-BODY\n', '当前注入没被污染（仍是 legacy）')
+const st11 = await callRoute(m11.registered, '/dsh-armor/api/state')
+ok(st11.json.persona.kind === 'legacy' && st11.json.persona.path === legacyFile, '/state 的 kind/path 与注入一致')
+
+console.log('\n[16] YAML 内联 persona 覆盖期：不假装生效、不写到 cwd')
+const m12 = makeCtx()
+mod.apply(m12.ctx, { persona: 'INLINE-BODY\n' })
+ok(m12.sections[0].text({}) === 'INLINE-BODY\n', '内联值生效')
+const svInline = await callRoute(m12.registered, '/dsh-armor/api/save', 'POST', { which: 'persona', text: 'WANT-TO-SAVE\n' })
+ok(svInline.code === 200 && svInline.json.effective === false, '内联下保存 → effective:false（不假装生效）')
+ok(svInline.json.path === legacyFile, `内联下保存回落到 armor\\persona.md（实得 ${svInline.json.path}）`)
+ok(fs.readFileSync(legacyFile, 'utf8') === 'WANT-TO-SAVE\n', '内联下保存确实写进了文件')
+const cwdTmp = fs.readdirSync(process.cwd()).filter((f) => f.includes('.tmp'))
+ok(cwdTmp.length === 0, `没有往 cwd 写临时文件（实得 ${JSON.stringify(cwdTmp)}）`)
+ok(m12.sections[0].text({}) === 'INLINE-BODY\n', '内联下保存不改变当前注入')
+const actInline = await callRoute(m12.registered, '/dsh-armor/api/activate', 'POST', { persona: 'beta' })
+ok(actInline.code === 200 && actInline.json.effective === false, '内联下 activate → effective:false')
+ok(actInline.json.reason && actInline.json.reason.includes('内联'), 'activate 给出 reason（说明是内联覆盖）')
+ok(m12.sections[0].text({}) === 'INLINE-BODY\n', '内联下切指针不改变注入内容')
+
+console.log('\n[17] /persona/create 与 /save 的参数校验')
+const m13 = makeCtx()
+mod.apply(m13.ctx, {})
+ok((await callRoute(m13.registered, '/dsh-armor/api/persona/create', 'POST', { id: 'child-a', from: '../evil' })).code === 400, 'from 非法 → 400')
+ok((await callRoute(m13.registered, '/dsh-armor/api/persona/create', 'POST', { id: 'child-a', from: 'nosuch' })).code === 404, 'from 不存在 → 404')
+ok(!fs.existsSync(path.join(personasDir, 'child-a')), 'from 校验失败时不留下半个目录')
+const crFrom = await callRoute(m13.registered, '/dsh-armor/api/persona/create', 'POST', { id: 'child-a', from: 'beta' })
+ok(crFrom.code === 200 && fs.readFileSync(path.join(personasDir, 'child-a', 'persona.md'), 'utf8') === 'BETA-NEW\n', 'from 生效时复制来源内容')
+ok((await callRoute(m13.registered, '/dsh-armor/api/persona/create', 'POST', { id: 'beta.' })).code === 400, 'id 尾点 → 400（Windows 尾点目录难处理）')
+ok((await callRoute(m13.registered, '/dsh-armor/api/persona/create', 'POST', { id: '-lead' })).code === 400, 'id 以 - 开头 → 400')
+ok((await callRoute(m13.registered, '/dsh-armor/api/save', 'POST', { which: 'persona', id: 'never-created', text: 'x' })).code === 404, '/save 带不存在的 id → 404')
+ok(!fs.existsSync(path.join(personasDir, 'never-created')), '/save 没有凭空造出人设目录')
+
+console.log('\n[18] 指针指向不存在的人设：面板能看出来')
+fs.writeFileSync(activeFile, JSON.stringify({ schema: 1, persona: 'ghost' }), 'utf8')
+const m14 = makeCtx()
+mod.apply(m14.ctx, {})
+const st14 = await callRoute(m14.registered, '/dsh-armor/api/state')
+ok(st14.json.active.persona === 'ghost', '/state 如实报出指针值')
+ok(st14.json.persona.kind === 'legacy', '实际注入回落 legacy')
+ok(st14.json.persona.fallbackFrom === 'ghost', `明示 fallbackFrom（实得 ${JSON.stringify(st14.json.persona.fallbackFrom)}）`)
+ok(st14.json.persona.effective === false, 'effective:false，面板不会误报生效')
+
+console.log('\n[19] 指针热更新：库 → legacy（反向）')
+fs.writeFileSync(activeFile, JSON.stringify({ schema: 1, persona: 'fixture' }), 'utf8')
+const m15 = makeCtx()
+mod.apply(m15.ctx, { watchIntervalMs: 30 })
+ok(m15.sections[0].text({}).startsWith('BASE-A'), '前置：库模式生效')
+fs.writeFileSync(activeFile, JSON.stringify({ schema: 1, persona: 'legacy' }), 'utf8')
+await new Promise((r) => setTimeout(r, 300))
+const t15 = m15.sections[0].text({})
+ok(t15 === fs.readFileSync(legacyFile, 'utf8'), `切回 legacy 生效且不拼 _base（实得 ${JSON.stringify(t15)}）`)
 
 console.log(`\n===== ${pass} passed, ${fail} failed =====`)
 if (fail === 0) console.log(`（测试用的临时 DSH_HOME: ${tmpHome}）`)

@@ -38,7 +38,15 @@ let dirArg = ''
 const positional = []
 for (let i = 0; i < argv.length; i += 1) {
   const arg = argv[i]
-  if (arg === '--dir') { i += 1; dirArg = argv[i] ?? ''; continue }
+  if (arg === '--dir') {
+    i += 1
+    if (i >= argv.length) {
+      console.error('✗ --dir 后面要跟一个目录')
+      process.exit(2)
+    }
+    dirArg = argv[i]
+    continue
+  }
   if (arg.startsWith('--')) continue
   positional.push(arg)
 }
@@ -54,7 +62,9 @@ function readJsonSafe(file) {
 
 function parseSections(text) {
   const found = []
-  const re = /【([^】\n]{1,12})】/g
+  // 只认行首（允许前导空白）的【…】：正文里写一句「他说【笨蛋】」不该被当成段头 ——
+  // 那会误报「重复段名」，还会把 pick() 的切片截断成只剩半句。
+  const re = /^[ \t]*【([^】\n]{1,12})】/gm
   let match
   while ((match = re.exec(text)) !== null) found.push({ name: match[1], at: match.index })
   return found
@@ -181,9 +191,11 @@ function lintLegacy() {
   return {
     id: 'legacy',
     bytes: linted.bytes,
-    errors: [],
+    // 只豁免「缺段」这一条。空文件、体积超限这类真问题必须留下 ——
+    // 否则 `npm run lint:persona`（默认带 --legacy）在任何情况下都是绿的，等于没有检查。
+    errors: linted.errors.filter((e) => !e.startsWith('缺段')),
     warns: linted.warns.filter((w) => !w.startsWith('缺段')),
-    infos: [...linted.infos, `段名检查已跳过（legacy 文件是旧格式）`],
+    infos: [...linted.infos, '段名检查已跳过（legacy 是旧格式，不做 9 段要求）'],
   }
 }
 

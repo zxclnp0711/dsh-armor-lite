@@ -38,7 +38,7 @@ dsh-armor-lite/
 │  ├─ default-base.md    # 硬约束片段的兜底（用户没建 personas\_base\hard-rules.md 时用它）
 │  └─ default-rules.md   # 规则段的内置默认
 └─ tools/
-   ├─ selftest.mjs       # 离线自测（89 项，不动真实 $DSH_HOME）
+   ├─ selftest.mjs       # 离线自测（118 项，不动真实 $DSH_HOME）
    ├─ persona-lint.mjs   # 人设结构检查（首行 + 9 段 / 口头禅条数 / 尺寸 / 变量）
    └─ dump-prompt.mjs    # 从会话日志里捞出渲染后的系统提示词
 ```
@@ -172,13 +172,13 @@ ctx.on('agent/status', (payload) => {
 
 | 路由 | 方法 | 说明 |
 |---|---|---|
-| `/dsh-armor/api/state` | GET | 旧字段全保留：`{ armed, recover, continue, home, watchIntervalMs, recoverMax, continueMax, persona, rules }`；新增 `active: { persona }` 与 `personas: { dir, activeFile, available[] }`。`persona` 上多出 `kind` / `id` / `composed: { baseFile, baseBytes, totalBytes }` |
-| `/dsh-armor/api/save` | POST | `{ which: 'persona'\|'rules', text, id? }` → 写盘（临时文件 + rename）并立即生效；带 `id` 时写库里的那一份 |
+| `/dsh-armor/api/state` | GET | 旧字段全保留：`{ armed, recover, continue, home, watchIntervalMs, recoverMax, continueMax, persona, rules }`；新增 `active: { persona }` 与 `personas: { dir, activeFile, available[] }`。`persona` 上多出 `kind` / `id` / `requested` / `fallbackFrom` / `effective` / `composed: { baseFile, baseBytes, totalBytes }` |
+| `/dsh-armor/api/save` | POST | `{ which: 'persona'\|'rules', text, id? }` → 写盘（临时文件 + rename）；带 `id` 时写库里的那一份。返回 `{ ok, path, bytes, effective, reason? }`：**只有写入的是"当前正在注入的那份"才改内存**，否则 `effective:false` 并给出 `reason`（否则会当场把注入换成另一份人设，还会连带丢掉 `_base` 拼接）。带不存在的 `id` → 404（不凭空造目录） |
 | `/dsh-armor/api/toggle` | POST | `{ enabled: boolean, key?: 'armed'\|'recover'\|'continue' }` → 切换并存 `state.json`；`key` 省略即 `armed`，旧调用照旧可用 |
 | `/dsh-armor/api/personas` | GET | `{ active, dir, activeFile, base, legacy, list[] }`；列表只在被调用时扫目录（不进 2 秒轮询） |
-| `/dsh-armor/api/activate` | POST | `{ persona: '<id>' \| 'legacy' }` → 写 `active.json` + 立即重读，不等轮询 |
-| `/dsh-armor/api/persona/create` | POST | `{ id, from? }` → 建目录、从 `_template`（或 `from`）复制 persona.md、生成 meta.json |
-| `/dsh-armor/api/persona/remove` | POST | `{ id }` → 移入 `armor\trash\<时间戳>-<id>\`（可手动还原）；正在使用中的那份拒绝移走 |
+| `/dsh-armor/api/activate` | POST | `{ persona: '<id>' \| 'legacy' }` → 写 `active.json` + 立即重读。返回 `{ ok, persisted, effective, reason?, persona }`：被 YAML 内联或 `personaFile` 覆盖时 `effective:false`（指针确实切了，但注入内容不变 —— 不能说"已生效"） |
+| `/dsh-armor/api/persona/create` | POST | `{ id, from? }` → 建目录、复制 `from` 或 `_template` 的 persona.md、生成 meta.json。`from` 非法 → 400、不存在 → 404、重名 → 409（**不静默回退模板**） |
+| `/dsh-armor/api/persona/remove` | POST | `{ id }` → 移入 `armor\trash\<时间戳>-<id>\`（可手动还原）；使用中的那份 → 409，面板从「管理」列表里对非使用中的项调用它 |
 
 ## 配置项（`cordis.patch.yml` 的 `config`）
 
@@ -217,7 +217,7 @@ ctx.on('agent/status', (payload) => {
 改完 `strip-rules.js` / `refusal-recover.js` / `index.js` 先跑离线自测 —— 它自己把 `DSH_HOME` 指到临时目录，不碰你的真实配置，也不用重启宿主：
 
 ```sh
-node tools/selftest.mjs                 # 89 项，退出码非 0 表示有失败
+node tools/selftest.mjs                 # 118 项，退出码非 0 表示有失败
 node tools/persona-lint.mjs --legacy    # 人设结构检查（首行 + 9 段、口头禅条数、尺寸、变量）；有 error 时退出码 1
 ```
 
@@ -251,6 +251,9 @@ node tools/persona-lint.mjs --legacy    # 人设结构检查（首行 + 9 段、
 - `_base/hard-rules.md` 是全局的：改它会影响库里**所有**人设。这是刻意的（硬约束不该随角色变），但要清楚它的作用面。
 - 人设库里没有多语言：一份人设一个文件，`id` 全 ASCII。要分语言就建两份人设（如 `jinzhien` / `jinzhien-ja`）。
 - 面板上的「移走」是把目录移进 `armor\trash\`，不是真删除；`trash` 目录不会自动清理。
+- **YAML 内联 `persona` 或 `personaFile` 覆盖期间，改指针 / 保存文件都不会改变注入内容**。接口会返回 `effective:false` 并给出 `reason`，面板按 warn 显示 —— 这是刻意的：`config.persona` 优先级最高，假装生效只会让排查变成猜谜。
+- 指针指向的人设被手删（在资源管理器里删目录）时，注入会回落 `legacy`，`/state` 报 `fallbackFrom: '<原指针>'` + `effective:false`，面板的元信息行会带一条 ⚠。**不会静默**。
+- 面板的「管理」列表是移走的唯一入口：选中某个人设就等于把它变成"使用中"，而后端禁止移走使用中的那份。
 
 ## 环境
 

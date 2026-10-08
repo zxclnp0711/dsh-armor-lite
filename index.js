@@ -123,12 +123,19 @@ function loadText(spec, config) {
 //              → legacy（$DSH_HOME/armor/persona.md）→ 内置默认
 //  段文本 = _base/hard-rules.md（仅库模式拼，平台无关的硬约束）+ 角色正文。
 //  面板读写的是「角色正文」，_base 只读 —— 否则保存一次就把 base 抄进角色文件，越拼越长。
-const PERSONA_ID_RE = /^[a-z0-9][a-z0-9._-]{0,63}$/
+//  末尾不许是 '.' / '-'：Windows 会保留尾点（'beta.' 与 'beta' 并列存在，资源管理器里难处理），
+//  保留设备名（con/nul…）也靠这条+"必须含字母数字"挡掉大半。最长 63。
+const PERSONA_ID_RE = /^[a-z0-9](?:[a-z0-9._-]{0,61}[a-z0-9])?$/
 const LEGACY_ID = 'legacy'
 
 /** id 白名单。拼路径前必须过这道闸，否则 '..' 能写到 armor 目录外。 */
 function isValidPersonaId(id) {
   return typeof id === 'string' && id !== LEGACY_ID && PERSONA_ID_RE.test(id)
+}
+
+/** 临时文件名带 pid + 随机串：桌面端与 web profile 若共享同一个 $DSH_HOME，固定 `.tmp` 会互相踩。 */
+function tmpNameOf(file) {
+  return `${file}.${process.pid}.${Math.random().toString(36).slice(2, 8)}.tmp`
 }
 
 function personasDirOf(config) {
@@ -157,7 +164,7 @@ function saveActive(config, next) {
     const file = activeFileOf(config)
     fs.mkdirSync(path.dirname(file), { recursive: true })
     const body = `${JSON.stringify({ schema: 1, persona: next.persona, updatedAt: new Date().toISOString() }, null, 2)}\n`
-    const tmp = `${file}.tmp`
+    const tmp = tmpNameOf(file)
     fs.writeFileSync(tmp, body, 'utf8')
     fs.renameSync(tmp, file)
     return true
@@ -168,7 +175,10 @@ function saveActive(config, next) {
 
 function readBaseFragment(config) {
   if (!config.baseFragment) return { text: '', file: '' }
-  const dir = path.join(personasDirOf(config), config.baseFragment === 'default' ? '_base' : config.baseFragment)
+  const name = config.baseFragment === 'default' ? '_base' : config.baseFragment
+  // 配置里写 `..` 或绝对路径会读到库外的文件 —— 不是攻击面，是"打错字读到别的东西还不报错"
+  if (typeof name !== 'string' || name.includes('..') || path.isAbsolute(name)) return { text: '', file: '' }
+  const dir = path.join(personasDirOf(config), name)
   const file = path.join(dir, 'hard-rules.md')
   try {
     return { text: fs.readFileSync(file, 'utf8'), file }
@@ -250,12 +260,17 @@ function bundledPersona() {
 function readPersona(config, active) {
   const inline = typeof config.persona === 'string' && config.persona.trim()
   if (inline) {
-    return { ownText: config.persona, text: config.persona, file: '', src: 'YAML 内联 config.persona', inline: true, kind: 'inline', id: '', persisted: false, baseFile: '', baseBytes: 0 }
+    return { ownText: config.persona, text: config.persona, file: '', src: 'YAML 内联 config.persona', inline: true, kind: 'inline', id: '', requested: '', fallbackFrom: '', persisted: false, baseFile: '', baseBytes: 0 }
   }
 
   let target = config.personaFile
     ? { file: path.resolve(config.personaFile), kind: 'file', id: '' }
     : resolvePersonaTarget(config, active)
+
+  // 指针要的是哪一份。它和实际生效的那份不一致时（目录被手删、被 personaFile 覆盖），
+  // 必须一路带到面板上 —— 否则面板显示 "active: ghost" 而实际注入 legacy，等于说谎。
+  const requested = active.persona !== LEGACY_ID ? active.persona : ''
+  let fallbackFrom = ''
 
   let ownText = null
   try { ownText = fs.readFileSync(target.file, 'utf8') } catch { ownText = null }
@@ -265,10 +280,14 @@ function readPersona(config, active) {
     try {
       ownText = fs.readFileSync(legacyFile, 'utf8')
       target = { file: legacyFile, kind: LEGACY_ID, id: LEGACY_ID }
+      fallbackFrom = requested
     } catch {
       const fallback = bundledPersona()
-      return { ownText: fallback.text, text: fallback.text, file: legacyFile, src: fallback.src, inline: false, kind: 'bundled', id: '', persisted: false, baseFile: '', baseBytes: 0 }
+      return { ownText: fallback.text, text: fallback.text, file: legacyFile, src: fallback.src, inline: false, kind: 'bundled', id: '', requested, fallbackFrom: requested, persisted: false, baseFile: '', baseBytes: 0 }
     }
+  } else if (requested && target.kind !== 'library') {
+    // 读到的是文件，但不是指针要的那份（personaFile 覆盖，或库目录里那份已消失）
+    fallbackFrom = requested
   }
 
   const base = target.kind === 'library' ? readBaseFragment(config) : { text: '', file: '' }
@@ -281,6 +300,8 @@ function readPersona(config, active) {
     inline: false,
     kind: target.kind,
     id: target.id,
+    requested,
+    fallbackFrom,
     persisted: true,
     baseFile: base.file,
     baseBytes: Buffer.byteLength(base.text, 'utf8'),
@@ -321,21 +342,42 @@ function moveToTrash(config, id) {
 
 function createPersona(config, id, from) {
   const dir = path.join(personasDirOf(config), id)
-  if (fs.existsSync(dir)) throw new Error(`已存在：${dir}`)
+  if (fs.existsSync(dir)) {
+    const error = new Error(`已存在：${dir}`)
+    error.code = 'EEXIST_PERSONA'
+    throw error
+  }
+  // from 显式给了就必须真的存在：静默回退模板会让调用方以为"复制了某个角色"，
+  // 拿到的却是一张空骨架 —— 这类"看起来成功了"的失败比报错贵得多。
+  if (from !== undefined && from !== null && from !== '') {
+    if (!isValidPersonaId(from)) {
+      const error = new Error(`非法来源 id：${JSON.stringify(from)}`)
+      error.code = 'EBAD_FROM'
+      throw error
+    }
+    if (!fs.existsSync(personaFileOf(config, from))) {
+      const error = new Error(`来源人设不存在：${from}`)
+      error.code = 'ENOENT_FROM'
+      throw error
+    }
+  }
   fs.mkdirSync(dir, { recursive: true })
-  const source = from && isValidPersonaId(from)
+  const source = from
     ? personaFileOf(config, from)
     : path.join(personasDirOf(config), '_template', 'persona.md')
   // 回退链：用户库的 _template → 插件内置模板 → 硬编码最小骨架。
   // 少了中间这层，换个环境装插件就会退化成一段没有写作规范的裸骨架。
   let body
+  let actualSource = source
   try {
     body = fs.readFileSync(source, 'utf8')
   } catch {
     try {
       body = fs.readFileSync(bundled('./personas/_template/persona.md'), 'utf8')
+      actualSource = '内置 ./personas/_template/persona.md'
     } catch {
       body = `你是「${id}」，{一句话身份}。工作目录是 {{cwd}}。\n\n【身份】\n【人设】\n【口头禅】\n【行为模式】\n【反差萌】\n【思考模式】\n【表达技巧】\n【调节底线】\n【工作守则】\n`
+      actualSource = '硬编码骨架'
     }
   }
   const meta = {
@@ -347,7 +389,7 @@ function createPersona(config, id, from) {
   }
   fs.writeFileSync(path.join(dir, 'persona.md'), body, 'utf8')
   fs.writeFileSync(path.join(dir, 'meta.json'), `${JSON.stringify(meta, null, 2)}\n`, 'utf8')
-  return { dir, file: path.join(dir, 'persona.md'), source }
+  return { dir, file: path.join(dir, 'persona.md'), source: actualSource }
 }
 
 function normalizeRules(list) {
@@ -464,7 +506,7 @@ function saveState(state) {
     }, null, 2)}\n`
     // 先写临时文件再改名：半截 JSON 会让下次 loadState 整个回落「全开」，
     // 对破甲插件来说那等于悄悄把破甲打开 —— 代价比多一次 rename 大得多。
-    const tmp = `${stateFile()}.tmp`
+    const tmp = tmpNameOf(stateFile())
     fs.writeFileSync(tmp, body, 'utf8')
     fs.renameSync(tmp, stateFile())
     return true
@@ -539,6 +581,10 @@ function mountApi(hostCtx, state, slots, config, log, active) {
         ? {
             kind: slot.kind,
             id: slot.id,
+            requested: slot.requested || '',
+            // 非空 = 指针要的那份没生效，实际注入的是别的。面板必须把它说出来，否则显示与实际不符
+            fallbackFrom: slot.fallbackFrom || '',
+            effective: !slot.inline && !slot.fallbackFrom,
             composed: {
               baseFile: slot.baseFile,
               baseBytes: slot.baseBytes,
@@ -579,36 +625,55 @@ function mountApi(hostCtx, state, slots, config, log, active) {
       }
       const slot = slotOf(body.which)
       if (!slot) return sendJson(res, 400, { error: `未知目标 ${JSON.stringify(body.which)}` })
-      // 可选 id：写库里指定那份（面板切到别的人设后，编辑的可能是非 active 的那份）
-      let file = slot.watchFile
-      if (typeof body.id === 'string' && body.id) {
-        if (!slot.spec.compose) return sendJson(res, 400, { error: `${body.which} 段不支持 id` })
-        if (!isValidPersonaId(body.id)) return sendJson(res, 400, { error: `非法人设 id：${JSON.stringify(body.id)}` })
-        file = personaFileOf(config, body.id)
+
+      // 写哪一份：显式 id（库里那一份）→ 该段当前绑定的文件 → 内联时回落到常规路径。
+      // 内联 persona 的 slot.watchFile 是空串，直接拼会得到 "<cwd>.<pid>...tmp" 再 rename 到 ""，
+      // 那是本文件里唯一能写到 personasDir 之外的路径。
+      const explicitId = typeof body.id === 'string' && body.id ? body.id : ''
+      if (explicitId && !slot.spec.compose) return sendJson(res, 400, { error: `${body.which} 段不支持 id` })
+      if (explicitId && !isValidPersonaId(explicitId)) return sendJson(res, 400, { error: `非法人设 id：${JSON.stringify(explicitId)}` })
+      // 显式 id 必须已存在：否则递归 mkdir 会凭空造出一个没有 meta.json 的"人设"目录
+      if (explicitId && !fs.existsSync(personaFileOf(config, explicitId))) {
+        return sendJson(res, 404, { error: `人设不存在：${explicitId}` })
       }
+      const file = explicitId
+        ? personaFileOf(config, explicitId)
+        : (slot.watchFile || path.join(armorDir(), slot.spec.defaultFile))
+
+      // 这次写入是否作用于「当前正在注入的那份」。写别的份时绝不能动内存 ——
+      // 否则下一次请求会当场换成另一份人设（库→非库切换还会连带丢掉 _base 拼接）。
+      const writesActive = explicitId ? explicitId === (slot.inline ? '' : slot.id) : !slot.inline
+      const reason = writesActive
+        ? ''
+        : explicitId
+          ? `写的是库里的另一份（${explicitId}），当前注入的仍是 ${slot.inline ? 'YAML 内联值' : (slot.id || 'legacy')}`
+          : 'YAML 内联 config.persona 优先，保存文件不改变当前注入内容'
+
       try {
         fs.mkdirSync(path.dirname(file), { recursive: true })
         // 原子写：人设是注入文本，半截文件会让模型读到被截断的指令
-        const tmp = `${file}.tmp`
+        const tmp = tmpNameOf(file)
         fs.writeFileSync(tmp, body.text, 'utf8')
         fs.renameSync(tmp, file)
-        // 立刻生效，不等下一次轮询；并让位给文件（内联值不再优先）
-        slot.inline = false
-        slot.src = file
-        slot.watchFile = file
-        if (slot.spec.compose) {
-          slot.ownText = body.text
-          // 只有库模式才拼 _base：legacy 下保存必须保持与旧版逐字节相同的输出
-          const base = slot.kind === 'library' ? readBaseFragment(config) : { text: '', file: '' }
-          slot.text = base.text.trim() ? `${base.text.trimEnd()}\n\n${body.text.trimEnd()}\n` : body.text
-          slot.baseFile = base.file
-          slot.baseBytes = Buffer.byteLength(base.text, 'utf8')
-        } else {
-          slot.text = body.text
+        if (writesActive) {
+          // 立刻生效，不等下一次轮询；并让位给文件（内联值不再优先）
+          slot.inline = false
+          slot.src = file
+          slot.watchFile = file
+          if (slot.spec.compose) {
+            slot.ownText = body.text
+            // 只有库模式才拼 _base：legacy 下保存必须保持与旧版逐字节相同的输出
+            const base = slot.kind === 'library' ? readBaseFragment(config) : { text: '', file: '' }
+            slot.text = base.text.trim() ? `${base.text.trimEnd()}\n\n${body.text.trimEnd()}\n` : body.text
+            slot.baseFile = base.file
+            slot.baseBytes = Buffer.byteLength(base.text, 'utf8')
+          } else {
+            slot.text = body.text
+          }
         }
         const bytes = Buffer.byteLength(body.text, 'utf8')
-        log(`${slot.spec.section} saved <- ${file} (${bytes} bytes)`)
-        sendJson(res, 200, { ok: true, path: file, bytes })
+        log(`${slot.spec.section} saved <- ${file} (${bytes} bytes, effective=${writesActive})`)
+        sendJson(res, 200, { ok: true, path: file, bytes, effective: writesActive, ...(writesActive ? {} : { reason }) })
       } catch (e) {
         sendJson(res, 500, { error: String((e && e.message) || e) })
       }
@@ -673,11 +738,26 @@ function mountApi(hostCtx, state, slots, config, log, active) {
         slot.src = got.src
         slot.kind = got.kind
         slot.id = got.id
+        slot.requested = got.requested
+        slot.fallbackFrom = got.fallbackFrom
         slot.baseFile = got.baseFile
         slot.baseBytes = got.baseBytes
+        // 内联时 readPersona 返回的就是内联值：指针变了但注入内容没变，别报"已生效"
+        slot.inline = got.inline
       }
-      log(`active.persona -> ${id} (persisted=${persisted})`)
-      sendJson(res, 200, { ok: true, active: { persona: id }, persisted, persona: describe(slot) })
+      // 「生效」= 注入内容确实来自被切的那一份。内联覆盖 / 指针目标缺失时都不算生效
+      const effective = slot
+        ? (slot.inline
+            ? false
+            : (id === LEGACY_ID ? slot.kind === LEGACY_ID : (slot.kind === 'library' && slot.id === id)))
+        : false
+      const reason = effective
+        ? ''
+        : (slot && slot.inline
+            ? 'YAML 内联 config.persona 优先，改指针不会改变注入内容'
+            : (slot && slot.fallbackFrom ? `${slot.fallbackFrom} 读不到，实际注入的是 ${slot.kind}` : '未生效'))
+      log(`active.persona -> ${id} (persisted=${persisted}, effective=${effective})`)
+      sendJson(res, 200, { ok: true, active: { persona: id }, persisted, effective, persona: describe(slot), ...(effective ? {} : { reason }) })
     }],
 
     ['/dsh-armor/api/persona/create', async (req, res) => {
@@ -691,7 +771,11 @@ function mountApi(hostCtx, state, slots, config, log, active) {
         log(`persona created <- ${created.file} (来源 ${created.source})`)
         sendJson(res, 200, { ok: true, ...created, list: listPersonas(config) })
       } catch (e) {
-        sendJson(res, 409, { error: String((e && e.message) || e) })
+        const code = e && e.code
+        if (code === 'EEXIST_PERSONA') return sendJson(res, 409, { error: String(e.message) })
+        if (code === 'EBAD_FROM') return sendJson(res, 400, { error: String(e.message) })
+        if (code === 'ENOENT_FROM') return sendJson(res, 404, { error: String(e.message) })
+        sendJson(res, 500, { error: String((e && e.message) || e) })
       }
     }],
 
@@ -751,6 +835,8 @@ export function apply(ctx, rawConfig) {
         src: got.src,
         kind: got.kind,
         id: got.id,
+        requested: got.requested,
+        fallbackFrom: got.fallbackFrom,
         baseFile: got.baseFile,
         baseBytes: got.baseBytes,
       }
@@ -822,16 +908,19 @@ export function apply(ctx, rawConfig) {
           if (slot.spec.compose) {
             // 人设段：指针 / _base / 角色文件任一变化都要重算（readPersona 每次把两个文件读一遍）
             const got = readPersona(config, active)
-            if (got.text !== slot.text || got.file !== slot.watchFile || got.kind !== slot.kind) {
+            // fallbackFrom 也要参与比较：指针目标被手删时 text 可能一字不变，但"生效来源"变了
+            if (got.text !== slot.text || got.file !== slot.watchFile || got.kind !== slot.kind || got.fallbackFrom !== slot.fallbackFrom) {
               slot.ownText = got.ownText
               slot.text = got.text
               slot.watchFile = got.file
               slot.src = got.src
               slot.kind = got.kind
               slot.id = got.id
+              slot.requested = got.requested
+              slot.fallbackFrom = got.fallbackFrom
               slot.baseFile = got.baseFile
               slot.baseBytes = got.baseBytes
-              log(`${slot.spec.section} reloaded <- ${got.src} (kind=${got.kind})`)
+              log(`${slot.spec.section} reloaded <- ${got.src} (kind=${got.kind}${got.fallbackFrom ? `, fallbackFrom=${got.fallbackFrom}` : ''})`)
             }
             continue
           }

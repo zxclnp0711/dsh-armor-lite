@@ -126,6 +126,7 @@ window.__ModuleLoader__.load({
     function PersonaPicker({ data, busy, onActivate, onCreate, onRemove }) {
       const [open, setOpen] = React.useState(false)
       const [draft, setDraft] = React.useState('')
+      const [manage, setManage] = React.useState(false)
       const current = (data.active && data.active.persona) || 'legacy'
       const available = (data.personas && data.personas.available) || []
       const options = [{ id: 'legacy', name: 'legacy · 直读 armor\\persona.md' }]
@@ -133,7 +134,8 @@ window.__ModuleLoader__.load({
           id: p.id,
           name: `${p.emoji ? `${p.emoji} ` : ''}${p.name} · ${p.bytes}B${p.valid === false ? ' · 缺 persona.md' : ''}`,
         })))
-      const idOk = /^[a-z0-9][a-z0-9._-]{0,63}$/.test(draft)
+      // 与后端 PERSONA_ID_RE 同口径：末尾不许是 '.' / '-'
+      const idOk = /^[a-z0-9](?:[a-z0-9._-]{0,61}[a-z0-9])?$/.test(draft)
       return h('section', { style: { marginTop: 26 } },
         h('div', { style: { display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap' } },
           h('h3', { style: { margin: 0, fontSize: 15, fontWeight: 700, color: T.label } }, '人设库'),
@@ -151,10 +153,36 @@ window.__ModuleLoader__.load({
             },
           }, options.map((o) => h('option', { key: o.id, value: o.id }, o.name))),
           h(Btn, { onClick: () => setOpen((v) => !v), disabled: !!busy }, open ? '取消' : '新建副本'),
-          current !== 'legacy'
-            ? h(Btn, { onClick: () => onRemove(current), disabled: !!busy }, '移走')
+          // 移走入口必须列在库里：后端禁止移走"使用中"的那份，而选中某个人设就等于让它变成使用中 ——
+          // 只放一个跟随当前值的按钮，这个功能永远点不到。
+          available.length
+            ? h(Btn, { onClick: () => setManage((v) => !v), disabled: !!busy },
+                manage ? '收起管理' : `管理 · ${available.length}`)
             : null,
         ),
+        manage
+          ? h('div', {
+              style: {
+                marginTop: 10, padding: '10px 12px', borderRadius: 10,
+                background: T.layer2, border: `1px solid ${T.border}`,
+              },
+            },
+              available.map((p) => h('div', {
+                key: p.id,
+                style: { display: 'flex', alignItems: 'center', gap: 10, padding: '3px 0', flexWrap: 'wrap' },
+              },
+                h('span', { style: { fontSize: 12.5, color: T.label } }, `${p.emoji ? `${p.emoji} ` : ''}${p.name}`),
+                h('span', {
+                  style: { fontSize: 11.5, color: T.label2, fontFamily: 'ui-monospace, Consolas, monospace' },
+                }, p.id),
+                h('span', { style: { fontSize: 11.5, color: T.label2 } }, `${p.bytes}B`),
+                h('span', { style: { flex: 1 } }),
+                p.id === current
+                  ? h('span', { style: { fontSize: 11.5, color: T.label2 } }, '使用中')
+                  : h(Btn, { onClick: () => onRemove(p.id), disabled: !!busy }, '移走'),
+              )),
+            )
+          : null,
         open
           ? h('div', { style: { marginTop: 10, display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' } },
               h('input', {
@@ -171,10 +199,17 @@ window.__ModuleLoader__.load({
               h(Btn, {
                 primary: true,
                 disabled: !!busy || !idOk,
-                onClick: () => { onCreate(draft); setDraft(''); setOpen(false) },
+                onClick: () => {
+                  // 失败时保留表单与输入 —— 清掉等于让用户重打一遍
+                  Promise.resolve(onCreate(draft)).then((ok) => {
+                    if (ok) { setDraft(''); setOpen(false) }
+                  })
+                },
               }, '创建'),
               h('span', { style: { fontSize: 11.5, color: draft && !idOk ? T.err : T.label2 } },
-                draft && !idOk ? 'id 只能是小写字母/数字/._-，且以字母或数字开头' : '从 _template 复制一份骨架'),
+                draft && !idOk
+                  ? 'id 只能是小写字母/数字/._-，且以字母或数字开头结尾'
+                  : '从 _template 复制一份骨架'),
             )
           : null,
       )
@@ -188,8 +223,15 @@ window.__ModuleLoader__.load({
       const [persona, setPersona] = React.useState('')
       const [rules, setRules] = React.useState('')
       const [dirty, setDirty] = React.useState({ persona: false, rules: false })
+      // 有未保存草稿时切换人设要二次确认；这里记「待确认的目标 id」
+      const [pendingActivate, setPendingActivate] = React.useState('')
       const alive = React.useRef(true)
-      React.useEffect(() => () => { alive.current = false }, [])
+      // 体内必须重置回 true：StrictMode / dev 双调用下 cleanup 会先跑一次，
+      // 只写 cleanup 会把 alive.current 永久钉成 false，面板就永远停在「读取中…」。
+      React.useEffect(() => {
+        alive.current = true
+        return () => { alive.current = false }
+      }, [])
 
       const load = React.useCallback(async () => {
         setBusy('load')
@@ -217,8 +259,28 @@ window.__ModuleLoader__.load({
           const body = await postJson('/save', { which, text })
           if (!alive.current) return
           setDirty((d) => ({ ...d, [which]: false }))
-          setNote({ kind: 'ok', text: `已保存 ${body.bytes} 字节 → ${body.path}（约 2 秒内对后续请求生效）` })
-          setData((s) => (s ? { ...s, [which]: { ...s[which], text, bytes: body.bytes, source: body.path, persisted: true } } : s))
+          if (body.effective === false) {
+            // 写成功但没生效（被 YAML 内联覆盖，或写的是库里另一份）—— 不能报「已生效」
+            setNote({ kind: 'warn', text: `已写入 ${body.path}（${body.bytes} 字节），但当前未生效：${body.reason || '非当前生效的那份'}` })
+            await refreshList()
+          } else {
+            setNote({ kind: 'ok', text: `已保存 ${body.bytes} 字节 → ${body.path}（约 2 秒内对后续请求生效）` })
+            setData((s) => (s
+              ? {
+                  ...s,
+                  [which]: {
+                    ...s[which],
+                    text,
+                    bytes: body.bytes,
+                    source: body.path,
+                    persisted: true,
+                    effective: true,
+                    requested: '',
+                    fallbackFrom: '',
+                  },
+                }
+              : s))
+          }
         } catch (e) {
           if (alive.current) setNote({ kind: 'err', text: `保存失败：${e.message}` })
         } finally {
@@ -234,7 +296,10 @@ window.__ModuleLoader__.load({
           setData((s) => (s
             ? { ...s, active: body.active, personas: { ...(s.personas || {}), dir: body.dir, activeFile: body.activeFile, available: body.list } }
             : s))
-        } catch { /* 列表刷新失败不影响主流程 */ }
+        } catch (e) {
+          // 刷新失败必须说出来：否则下拉停在旧值，已移走的人设还留在选项里
+          if (alive.current) setNote({ kind: 'warn', text: `人设列表刷新失败：${e.message}（下拉可能停在旧值）` })
+        }
       }
 
       const activate = async (id) => {
@@ -242,11 +307,19 @@ window.__ModuleLoader__.load({
         try {
           const body = await postJson('/activate', { persona: id })
           if (!alive.current) return
+          setPendingActivate('')
           setData((s) => (s ? { ...s, active: body.active, persona: body.persona } : s))
           setPersona((body.persona && body.persona.text) || '')
           setDirty((d) => ({ ...d, persona: false }))
           const label = id === 'legacy' ? 'legacy（直读 armor\\persona.md）' : id
-          setNote({ kind: 'ok', text: `已切到 ${label}，下一次请求即生效。` })
+          if (body.effective === false) {
+            setNote({ kind: 'warn', text: `指针已切到 ${label}，但当前未生效：${body.reason || '被覆盖'}` })
+          } else if (body.persisted === false) {
+            setNote({ kind: 'warn', text: `已切到 ${label} 并当场生效，但 active.json 没写下去（重启后会回到旧值）。` })
+          } else {
+            setNote({ kind: 'ok', text: `已切到 ${label}，下一次请求即生效。` })
+          }
+          await refreshList()
         } catch (e) {
           if (alive.current) setNote({ kind: 'err', text: `切换失败：${e.message}` })
         } finally {
@@ -254,15 +327,27 @@ window.__ModuleLoader__.load({
         }
       }
 
+      // 切换会覆盖编辑器内容：有未保存草稿时要求再选一次确认
+      const requestActivate = (id) => {
+        if (dirty.persona && pendingActivate !== id) {
+          setPendingActivate(id)
+          setNote({ kind: 'warn', text: `人设正文有未保存的修改。再选一次 ${id} 就切换（未保存内容会丢）。` })
+          return
+        }
+        void activate(id)
+      }
+
       const createPersona = async (id) => {
         setBusy('create')
         try {
           const body = await postJson('/persona/create', { id })
-          if (!alive.current) return
-          setNote({ kind: 'ok', text: `已建 ${body.file}（来源 ${body.source}）。填好人设后在左侧下拉里选它。` })
+          if (!alive.current) return false
+          setNote({ kind: 'ok', text: `已建 ${body.file}（来源 ${body.source}）。填好人设后在上方下拉里选它。` })
           await refreshList()
+          return true
         } catch (e) {
           if (alive.current) setNote({ kind: 'err', text: `新建失败：${e.message}` })
+          return false
         } finally {
           if (alive.current) setBusy('')
         }
@@ -305,7 +390,12 @@ window.__ModuleLoader__.load({
           if (!alive.current) return
           setData((s) => (s ? { ...s, [key]: body[key] } : s))
           const on = !!body[key]
-          setNote({ kind: on ? 'ok' : 'warn', text: NOTE[key] ? NOTE[key][on ? 'on' : 'off'] : `${key} → ${on}` })
+          const line = NOTE[key] ? NOTE[key][on ? 'on' : 'off'] : `${key} → ${on}`
+          // persisted=false 时页面看起来切了、重启又回来：这种事必须当场说
+          setNote({
+            kind: body.persisted === false ? 'warn' : (on ? 'ok' : 'warn'),
+            text: body.persisted === false ? `${line} 但 state.json 没写下去（重启后会回到旧值）。` : line,
+          })
         } catch (e) {
           if (alive.current) setNote({ kind: 'err', text: `切换失败：${e.message}` })
         } finally {
@@ -338,6 +428,8 @@ window.__ModuleLoader__.load({
         if (slot.kind === 'library') parts.push(`库模式 · ${slot.id}`)
         if (slot.kind === 'legacy') parts.push('legacy 直读')
         if (slot.kind === 'bundled') parts.push('内置兜底')
+        if (slot.fallbackFrom) parts.push(`⚠ 指针要的 ${slot.fallbackFrom} 没生效，实际注入的是上面这一份`)
+        else if (slot.requested && slot.kind !== 'library') parts.push(`⚠ 指针要的是 ${slot.requested}，被 personaFile 覆盖`)
         if (slot.composed && slot.composed.baseBytes > 0) {
           parts.push(`注入时前置 _base ${slot.composed.baseBytes} 字节 → 合计 ${slot.composed.totalBytes} 字节`)
         }
@@ -405,8 +497,8 @@ window.__ModuleLoader__.load({
         h(PersonaPicker, {
           key: 'personas',
           data, busy,
-          onActivate: (id) => void activate(id),
-          onCreate: (id) => void createPersona(id),
+          onActivate: (id) => requestActivate(id),
+          onCreate: (id) => createPersona(id),
           onRemove: (id) => void removePersona(id),
         }),
 
