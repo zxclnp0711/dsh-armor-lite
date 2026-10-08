@@ -180,6 +180,20 @@ ctx.on('agent/status', (payload) => {
 | `/dsh-armor/api/persona/create` | POST | `{ id, from? }` → 建目录、复制 `from` 或 `_template` 的 persona.md、生成 meta.json。`from` 非法 → 400、不存在 → 404、重名 → 409（**不静默回退模板**） |
 | `/dsh-armor/api/persona/remove` | POST | `{ id }` → 移入 `armor\trash\<时间戳>-<id>\`（可手动还原）；使用中的那份 → 409，面板从「管理」列表里对非使用中的项调用它 |
 
+## 面板配色（两个踩过的坑）
+
+面板不 import 任何 Harness 客户端包，控件自绘，颜色一律取宿主的语义 token。有两条必须记住：
+
+| 坑 | 现象 | 正确做法 |
+|---|---|---|
+| **深色主题下 `--dsw-alias-brand-primary` 是近白** | 深色主题里 brand 解析成 `neutral-bluish-50 = #fafafa`；primary 填充上的文字若写死 `#fff` → **白底白字，完全看不见** | 填充上的文字用 `--dsw-alias-label-primary-foreground`（同条件下是 `neutral-bluish-1000 = #0f1115`）。宿主自己的 `Button.module.css` / `Switch.module.css` 就是这么配对的 |
+| **原生 `button` 的 `appearance` 不关掉** | Chromium 会拿 UA 的 buttonface（白）当底色，把样式里设的背景顶掉 | 显式 `appearance: none` / `WebkitAppearance: none` |
+
+另外：所有 `var(--dsw-alias-*)` 都带 fallback（宿主自己的 CSS 也这么写，例如
+`var(--dsw-alias-label-primary, var(--dsh-boot-label-primary))`）—— 取不到变量时至少还是可读的深色配色，
+而不是让整条声明作废、露出浏览器默认外观。次要按钮也不用 `transparent`：深色主题下 `border-l1`
+只有 6% 不透明度，透明底 + 几乎不可见的边框等于没有按钮边界。
+
 ## 配置项（`cordis.patch.yml` 的 `config`）
 
 | 键 | 默认 | 说明 |

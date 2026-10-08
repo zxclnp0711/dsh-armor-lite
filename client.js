@@ -15,18 +15,29 @@ window.__ModuleLoader__.load({
 
     const API = '/dsh-armor/api'
 
+    // 主题 token 全部带 fallback —— 宿主自己的 CSS 就是这么写的
+    // （`var(--dsw-alias-label-primary, var(--dsh-boot-label-primary))`）。
+    // 两个坑记这里，别再踩：
+    //   1) 深色主题下 `--dsw-alias-brand-primary` 解析成 neutral-bluish-50 = #fafafa（近白），
+    //      所以 primary 填充上的文字**不能**写死 #fff —— 要用 label-primary-foreground（同条件下近黑）。
+    //   2) 原生 button 的 appearance 不关掉时，Chromium 会拿 buttonface（白）当底色。
     const T = {
-      layer1: 'var(--dsw-alias-bg-layer-1)',
-      layer2: 'var(--dsw-alias-bg-layer-2)',
-      border: 'var(--dsw-alias-border-l1)',
-      border2: 'var(--dsw-alias-border-l2)',
-      brand: 'var(--dsw-alias-brand-primary)',
-      label: 'var(--dsw-alias-label-primary)',
-      label2: 'var(--dsw-alias-label-secondary)',
-      ok: 'var(--dsw-alias-state-success-primary)',
-      err: 'var(--dsw-alias-state-error-primary)',
-      warn: 'var(--dsw-alias-state-warn-primary)',
+      layer1: 'var(--dsw-alias-bg-layer-1, #1b1d21)',
+      layer2: 'var(--dsw-alias-bg-layer-2, #212429)',
+      layer3: 'var(--dsw-alias-bg-layer-3, #2a2e34)',
+      border: 'var(--dsw-alias-border-l1, #ffffff1f)',
+      border2: 'var(--dsw-alias-border-l2, #ffffff2e)',
+      brand: 'var(--dsw-alias-button-primary-fill, var(--dsw-alias-brand-primary, #fafafa))',
+      brandText: 'var(--dsw-alias-label-primary-foreground, #0f1115)',
+      label: 'var(--dsw-alias-label-primary, #f5f6f7)',
+      label2: 'var(--dsw-alias-label-secondary, #a8adb5)',
+      hover: 'var(--dsw-alias-interactive-bg-hover, #ffffff14)',
+      ok: 'var(--dsw-alias-state-success-primary, #22c55e)',
+      err: 'var(--dsw-alias-state-error-primary, #f04438)',
+      warn: 'var(--dsw-alias-state-warn-primary, #f59e0b)',
     }
+    /** 原生控件外观一律关掉：留着它，背景色在某些状态下会被 UA 的 buttonface 顶掉。 */
+    const NO_APPEARANCE = { appearance: 'none', WebkitAppearance: 'none' }
 
     // ── 数据面 ────────────────────────────────────────────────────────
     async function call(path, init) {
@@ -60,16 +71,19 @@ window.__ModuleLoader__.load({
           display: 'inline-flex', alignItems: 'center', gap: compact ? 7 : 9,
           padding: compact ? '5px 11px' : '7px 14px', borderRadius: 999,
           cursor: busy ? 'wait' : 'pointer',
-          border: `1px solid ${on ? T.brand : T.border}`,
-          background: on ? T.brand : T.layer1,
-          color: on ? '#fff' : T.label2,
-          fontSize: compact ? 12 : 13, fontWeight: 600, fontFamily: 'inherit',
+          fontFamily: 'inherit',
+          ...NO_APPEARANCE,
+          border: `1px solid ${on ? T.brand : T.border2}`,
+          background: on ? T.brand : T.layer3,
+          // 开态填充在深色主题下是近白，文字必须用 foreground 而不是 #fff
+          color: on ? T.brandText : T.label2,
+          fontSize: compact ? 12 : 13, fontWeight: 600,
         },
       },
         h('span', {
           style: {
             width: 9, height: 9, borderRadius: 999,
-            background: on ? '#fff' : T.label2,
+            background: on ? T.brandText : T.label2,
             opacity: on ? 1 : 0.55,
           },
         }),
@@ -83,9 +97,12 @@ window.__ModuleLoader__.load({
         style: {
           padding: '6px 14px', borderRadius: 8, fontSize: 13, fontWeight: 600,
           fontFamily: 'inherit', cursor: disabled ? 'default' : 'pointer',
-          border: `1px solid ${primary ? T.brand : T.border}`,
-          background: primary ? T.brand : 'transparent',
-          color: primary ? '#fff' : T.label,
+          ...NO_APPEARANCE,
+          border: `1px solid ${primary ? T.brand : T.border2}`,
+          // 次要按钮给明确填充（不再用 transparent）：透明时按钮的可见性全压在边框上，
+          // 而深色主题下 border-l1 只有 6% 不透明度，看上去就是一块没有边界的东西
+          background: primary ? T.brand : T.layer3,
+          color: primary ? T.brandText : T.label,
           opacity: disabled ? 0.5 : 1,
         },
       }, children)
