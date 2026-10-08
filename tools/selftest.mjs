@@ -32,6 +32,42 @@ const ok = (cond, label) => {
   if (cond) { pass += 1; console.log(`  PASS  ${label}`) } else { fail += 1; console.log(`  FAIL  ${label}`) }
 }
 
+// ── HTTP 桥的调用辅助（人设库那几条路由要按真实请求形状测）──────────────────
+//  mountApi 注册的 handler 是 `(req,res) => { Promise.resolve(handler(req,res)).catch(...) }`
+//  —— 箭头函数体没有 return，所以不能 await 它，只能等 res.body 被填上。
+function fakeReq(method, body) {
+  const handlers = {}
+  const req = {
+    method,
+    on(event, cb) { (handlers[event] ||= []).push(cb); return req },
+    destroy() {},
+  }
+  queueMicrotask(() => {
+    if (body !== undefined) for (const cb of handlers.data ?? []) cb(Buffer.from(JSON.stringify(body)))
+    for (const cb of handlers.end ?? []) cb()
+  })
+  return req
+}
+function fakeRes() {
+  return {
+    code: 0,
+    body: '',
+    headers: null,
+    writeHead(code, headers) { this.code = code; this.headers = headers },
+    end(body) { this.body = body },
+  }
+}
+async function callRoute(registered, routePath, method = 'GET', body) {
+  const route = registered.find((r) => r.path === routePath)
+  if (!route) return { code: 0, json: null, missing: true }
+  const res = fakeRes()
+  route.handler(fakeReq(method, body), res)
+  for (let i = 0; i < 200 && res.body === ''; i += 1) await new Promise((r) => setTimeout(r, 2))
+  let json = null
+  try { json = JSON.parse(res.body) } catch { /* 非 JSON */ }
+  return { code: res.code, json }
+}
+
 /** 假 ctx：够 apply() 用，并且把注册面记下来给断言读。 */
 function makeCtx() {
   const sections = []
@@ -116,7 +152,7 @@ ok(m.sections[0].name === 'armor:persona' && m.sections[0].order === -1500, 'arm
 ok(m.sections[1].name === 'armor:rules' && m.sections[1].order === -1400, 'armor:rules @ -1400')
 ok(typeof m.listeners.get('system-prompt/assemble') === 'function', '挂了 system-prompt/assemble')
 ok(typeof m.listeners.get('agent/status') === 'function', '挂了 agent/status')
-ok(m.registered.length === 3, `HTTP 桥注册 3 条路由（实得 ${m.registered.length}）`)
+ok(m.registered.length === 7, `HTTP 桥注册 7 条路由（实得 ${m.registered.length}）`)
 
 console.log('\n[3] 事件驱动')
 const status = m.listeners.get('agent/status')
@@ -243,6 +279,120 @@ const feed = (turn, refusal) => {
 }
 feed(1, true); feed(2, true); feed(3, false); feed(4, true); feed(5, true)
 ok(fired2 === 4, `中间插一轮正常回答 -> 链重置，共补 4 次（实得 ${fired2}）`)
+
+// ── 人设库 ────────────────────────────────────────────────────────────────
+//  这几组是 v0.4.0 的核心改动面。要点：legacy 默认必须与旧版逐字节相同，
+//  库模式才拼 _base，且 /state 返回给面板的 text 只能是角色正文（否则保存会把 base 抄进角色文件）。
+const personasDir = path.join(armorDir, 'personas')
+const legacyFile = path.join(armorDir, 'persona.md')
+const activeFile = path.join(armorDir, 'active.json')
+const armCtx = { agent: { session: { header: { cwd: 'D:\\FIXTURE\\CWD' } }, options: { model: 'fixture-model' } } }
+
+console.log('\n[9] legacy 直读（默认路径：不拼 _base、行为与旧版一致）')
+const legacyPlain = '硬约束行一\n硬约束行二\n'
+fs.writeFileSync(legacyFile, legacyPlain, 'utf8')
+fs.rmSync(activeFile, { force: true })
+const m6 = makeCtx()
+mod.apply(m6.ctx, {})
+ok(m6.sections[0].text({}) === legacyPlain, 'legacy：段文本与原文件逐字节相同')
+ok(m6.sections[0].text({}) !== undefined && !m6.sections[0].text({}).includes('BASE-'), 'legacy：不拼 _base')
+fs.writeFileSync(legacyFile, '{{cwd}} ｜ {{model}} ｜ {{nope}} ｜ {{HOME}}\n', 'utf8')
+const m6b = makeCtx()
+mod.apply(m6b.ctx, {})
+const t6 = m6b.sections[0].text(armCtx)
+ok(t6.includes('D:\\FIXTURE\\CWD'), '插值：{{cwd}} 取 agent.session.header.cwd')
+ok(t6.includes('fixture-model'), '插值：{{model}} 取 agent.options.model')
+ok(t6.includes('{{nope}}'), '插值：未知 {{nope}} 原样保留（宿主插值会在这里抛错）')
+ok(t6.includes('{{HOME}}'), '插值：变量名大小写敏感，{{HOME}} 不命中')
+ok(!t6.includes('{{cwd}}') && !t6.includes('{{model}}'), '插值：已知变量已替换')
+const t6b = m6b.sections[0].text(undefined)
+ok(t6b.includes(path.sep === '\\' ? process.cwd() : process.cwd()), '插值：无 context 时 {{cwd}} 回落进程 cwd')
+
+console.log('\n[10] 库模式（_base 拼接 + 面板只看角色正文）')
+fs.mkdirSync(path.join(personasDir, '_base'), { recursive: true })
+fs.mkdirSync(path.join(personasDir, '_template'), { recursive: true })
+fs.mkdirSync(path.join(personasDir, 'fixture'), { recursive: true })
+fs.writeFileSync(path.join(personasDir, '_base', 'hard-rules.md'), 'BASE-A\nBASE-B\n', 'utf8')
+fs.writeFileSync(path.join(personasDir, 'fixture', 'persona.md'), 'ROLE-A\nROLE-B\n', 'utf8')
+fs.writeFileSync(path.join(personasDir, '_template', 'persona.md'), 'TEMPLATE\n', 'utf8')
+fs.writeFileSync(activeFile, JSON.stringify({ schema: 1, persona: 'fixture' }), 'utf8')
+const m7 = makeCtx()
+mod.apply(m7.ctx, {})
+const t7 = m7.sections[0].text({})
+ok(t7 === 'BASE-A\nBASE-B\n\nROLE-A\nROLE-B\n', `库模式：段文本 = _base + 角色（实得 ${JSON.stringify(t7)}）`)
+ok(!m7.sections[1].text({}).includes('BASE-'), '库模式：rules 段不受 _base 影响')
+const st7 = await callRoute(m7.registered, '/dsh-armor/api/state')
+ok(st7.json.persona.text === 'ROLE-A\nROLE-B\n', '/state：persona.text 只含角色正文')
+ok(st7.json.persona.kind === 'library' && st7.json.persona.id === 'fixture', '/state：kind/id 报出库模式')
+ok(st7.json.persona.composed && st7.json.persona.composed.baseBytes === 14, '/state：composed.baseBytes 报出 _base 体积')
+ok(st7.json.active && st7.json.active.persona === 'fixture', '/state：active.persona 报出当前指针')
+ok(Array.isArray(st7.json.personas.available), '/state：personas.available 是数组')
+
+console.log('\n[11] 坏指针回落（宁可少做事，也不能静默清空人设）')
+fs.writeFileSync(legacyFile, legacyPlain, 'utf8')
+fs.writeFileSync(activeFile, '{ 这不是 JSON', 'utf8')
+const m8 = makeCtx()
+mod.apply(m8.ctx, {})
+ok(m8.sections[0].text({}) === legacyPlain, '坏 JSON → 回落 legacy，不抛')
+fs.writeFileSync(activeFile, JSON.stringify({ schema: 1, persona: '../evil' }), 'utf8')
+const m8b = makeCtx()
+mod.apply(m8b.ctx, {})
+ok(m8b.sections[0].text({}) === legacyPlain, 'persona = "../evil" → 拒绝，回落 legacy')
+fs.writeFileSync(activeFile, JSON.stringify({ schema: 1, persona: 'ghost' }), 'utf8')
+const m8c = makeCtx()
+mod.apply(m8c.ctx, {})
+ok(m8c.sections[0].text({}) === legacyPlain, '指针指向不存在的人设 → 回落 legacy')
+
+console.log('\n[12] 人设库 API')
+fs.writeFileSync(activeFile, JSON.stringify({ schema: 1, persona: 'fixture' }), 'utf8')
+const m9 = makeCtx()
+mod.apply(m9.ctx, {})
+
+const listRes = await callRoute(m9.registered, '/dsh-armor/api/personas')
+ok(listRes.code === 200 && listRes.json.list.some((p) => p.id === 'fixture'), '/personas 列出 fixture')
+ok(listRes.json.list.every((p) => !p.id.startsWith('_')), '/personas 不把 _base/_template 当人设')
+ok(listRes.json.legacy && typeof listRes.json.legacy.exists === 'boolean', '/personas 报出 legacy 文件状态')
+
+const actBack = await callRoute(m9.registered, '/dsh-armor/api/activate', 'POST', { persona: 'legacy' })
+ok(actBack.code === 200 && actBack.json.active.persona === 'legacy', '/activate 切回 legacy')
+ok(JSON.parse(fs.readFileSync(activeFile, 'utf8')).persona === 'legacy', '/activate 已落盘')
+ok(actBack.json.persona.kind === 'legacy', '/activate 立即重读（不等轮询）')
+ok((await callRoute(m9.registered, '/dsh-armor/api/activate', 'POST', { persona: '../evil' })).code === 400, '/activate 拒绝非法 id')
+ok((await callRoute(m9.registered, '/dsh-armor/api/activate', 'POST', { persona: 'ghost' })).code === 404, '/activate 不存在 → 404')
+
+const cr = await callRoute(m9.registered, '/dsh-armor/api/persona/create', 'POST', { id: 'made-by-test' })
+ok(cr.code === 200 && fs.existsSync(path.join(personasDir, 'made-by-test', 'persona.md')), '/persona/create 建目录与 persona.md')
+ok(fs.existsSync(path.join(personasDir, 'made-by-test', 'meta.json')), '/persona/create 同时生成 meta.json')
+ok((await callRoute(m9.registered, '/dsh-armor/api/persona/create', 'POST', { id: '../evil' })).code === 400, '/persona/create 拒绝非法 id')
+ok((await callRoute(m9.registered, '/dsh-armor/api/persona/create', 'POST', { id: 'made-by-test' })).code === 409, '/persona/create 重名 → 409')
+
+const sv = await callRoute(m9.registered, '/dsh-armor/api/save', 'POST', { which: 'persona', id: 'fixture', text: 'NEW-ROLE\n' })
+ok(sv.code === 200 && fs.readFileSync(path.join(personasDir, 'fixture', 'persona.md'), 'utf8') === 'NEW-ROLE\n', '/save 带 id 写库里指定那份')
+ok(!fs.existsSync(path.join(personasDir, 'fixture', 'persona.md.tmp')), '/save 原子写不留 .tmp')
+ok((await callRoute(m9.registered, '/dsh-armor/api/save', 'POST', { which: 'persona', id: '../evil', text: 'x' })).code === 400, '/save 拒绝非法 id')
+ok((await callRoute(m9.registered, '/dsh-armor/api/save', 'POST', { which: 'rules', id: 'fixture', text: 'x' })).code === 400, '/save rules 段不接受 id')
+
+const rm = await callRoute(m9.registered, '/dsh-armor/api/persona/remove', 'POST', { id: 'made-by-test' })
+ok(rm.code === 200 && String(rm.json.trashed).includes('trash'), '/persona/remove 移入 trash')
+ok(!fs.existsSync(path.join(personasDir, 'made-by-test')), '/persona/remove 库里已不在')
+ok(fs.existsSync(rm.json.trashed), '/persona/remove 目标确实落到 trash（可还原）')
+ok((await callRoute(m9.registered, '/dsh-armor/api/persona/remove', 'POST', { id: 'legacy' })).code === 400, '/persona/remove 拒绝 legacy')
+ok((await callRoute(m9.registered, '/dsh-armor/api/persona/remove', 'POST', { id: 'ghost' })).code === 404, '/persona/remove 不存在 → 404')
+
+console.log('\n[13] legacy 下保存仍是旧行为（不引入 _base）')
+const m9b = makeCtx()
+mod.apply(m9b.ctx, {})
+const sv2 = await callRoute(m9b.registered, '/dsh-armor/api/save', 'POST', { which: 'persona', text: 'LEGACY-NEW\n' })
+ok(sv2.code === 200 && sv2.json.path === legacyFile, '/save 无 id → 仍写 legacy 文件')
+ok(m9b.sections[0].text({}) === 'LEGACY-NEW\n', 'legacy 保存后段文本不含 _base')
+
+console.log('\n[14] 指针热更新（手改 active.json，不重启）')
+const m10 = makeCtx()
+mod.apply(m10.ctx, { watchIntervalMs: 30 })
+fs.writeFileSync(activeFile, JSON.stringify({ schema: 1, persona: 'fixture' }), 'utf8')
+await new Promise((r) => setTimeout(r, 300))
+const t10 = m10.sections[0].text({})
+ok(t10 === 'BASE-A\nBASE-B\n\nNEW-ROLE\n', `轮询接住 active.json 变更（实得 ${JSON.stringify(t10)}）`)
 
 console.log(`\n===== ${pass} passed, ${fail} failed =====`)
 if (fail === 0) console.log(`（测试用的临时 DSH_HOME: ${tmpHome}）`)

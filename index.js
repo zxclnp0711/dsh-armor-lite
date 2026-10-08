@@ -39,6 +39,16 @@ const DEFAULTS = {
   personaFile: '',
   personaOrder: -1500,
 
+  // 人设库（多套人设 + 激活指针）
+  //   指针缺失 / JSON 坏 / persona 字段非法 → 一律按 'legacy' 处理（读 armor\persona.md），
+  //   也就是升级后默认行为与旧版逐字节相同，不需要迁移任何东西。
+  personaDir: '',
+  activeFile: '',
+  // 硬约束片段目录（相对 personas\）：'default' = _base；'' = 不拼
+  baseFragment: 'default',
+  // {{cwd}} / {{model}} / {{home}} / {{date}} 的最小替换；未知引用原样保留
+  interpolateVars: true,
+
   // 本地规则段（接 AGENTS.md 那套的活）
   rules: '',
   rulesFile: '',
@@ -81,6 +91,8 @@ const SECTION_SPECS = [
     defaultFile: 'persona.md',
     bundledFile: './personas/default.md',
     label: '人设',
+    // 走人设库（active.json 指针 + _base 拼接 + 插值）；rules 段不走，保持逐字节旧行为
+    compose: true,
   },
   {
     key: 'rules',
@@ -104,6 +116,238 @@ function loadText(spec, config) {
     return { text: fs.readFileSync(bundled(spec.bundledFile), 'utf8'), src: `内置默认 ${spec.bundledFile}` }
   } catch { /* 没有内置文件 */ }
   return { text: '', src: '无内容' }
+}
+
+// ── 人设库：多套人设 + 激活指针 ──────────────────────────────────────────
+//  取值优先级：YAML 内联 → personaFile → 库（active.json 指向的目录）
+//              → legacy（$DSH_HOME/armor/persona.md）→ 内置默认
+//  段文本 = _base/hard-rules.md（仅库模式拼，平台无关的硬约束）+ 角色正文。
+//  面板读写的是「角色正文」，_base 只读 —— 否则保存一次就把 base 抄进角色文件，越拼越长。
+const PERSONA_ID_RE = /^[a-z0-9][a-z0-9._-]{0,63}$/
+const LEGACY_ID = 'legacy'
+
+/** id 白名单。拼路径前必须过这道闸，否则 '..' 能写到 armor 目录外。 */
+function isValidPersonaId(id) {
+  return typeof id === 'string' && id !== LEGACY_ID && PERSONA_ID_RE.test(id)
+}
+
+function personasDirOf(config) {
+  return config.personaDir ? path.resolve(config.personaDir) : path.join(armorDir(), 'personas')
+}
+function activeFileOf(config) {
+  return config.activeFile ? path.resolve(config.activeFile) : path.join(armorDir(), 'active.json')
+}
+function personaFileOf(config, id) {
+  return path.join(personasDirOf(config), id, 'persona.md')
+}
+
+/** 读激活指针。任何异常都回落 legacy —— 宁可少做事，也不能因为一个坏 JSON 把人设整段清空。 */
+function loadActive(config) {
+  try {
+    const raw = JSON.parse(fs.readFileSync(activeFileOf(config), 'utf8'))
+    return { schema: Number(raw.schema) || 1, persona: isValidPersonaId(raw.persona) ? raw.persona : LEGACY_ID }
+  } catch {
+    return { schema: 1, persona: LEGACY_ID }
+  }
+}
+
+/** 与 saveState 同款：先写临时文件再改名，半截 JSON 不会出现。 */
+function saveActive(config, next) {
+  try {
+    const file = activeFileOf(config)
+    fs.mkdirSync(path.dirname(file), { recursive: true })
+    const body = `${JSON.stringify({ schema: 1, persona: next.persona, updatedAt: new Date().toISOString() }, null, 2)}\n`
+    const tmp = `${file}.tmp`
+    fs.writeFileSync(tmp, body, 'utf8')
+    fs.renameSync(tmp, file)
+    return true
+  } catch {
+    return false
+  }
+}
+
+function readBaseFragment(config) {
+  if (!config.baseFragment) return { text: '', file: '' }
+  const dir = path.join(personasDirOf(config), config.baseFragment === 'default' ? '_base' : config.baseFragment)
+  const file = path.join(dir, 'hard-rules.md')
+  try {
+    return { text: fs.readFileSync(file, 'utf8'), file }
+  } catch {
+    // 用户还没建 _base → 用内置兜底。缺了这一层，库模式会在「硬约束静默消失」的情况下运行，
+    // 而这正是本插件历史上最贵的一类故障（功能没了却不报错）。
+    try {
+      return { text: fs.readFileSync(bundled('./personas/default-base.md'), 'utf8'), file: '内置默认 ./personas/default-base.md', builtin: true }
+    } catch {
+      return { text: '', file }
+    }
+  }
+}
+
+function readCatalog(config) {
+  try {
+    const raw = JSON.parse(fs.readFileSync(path.join(personasDirOf(config), 'catalog.json'), 'utf8'))
+    const list = Array.isArray(raw.personas) ? raw.personas : []
+    return new Map(list.filter((row) => row && isValidPersonaId(row.id)).map((row) => [row.id, row]))
+  } catch {
+    return new Map()
+  }
+}
+
+/** 列出库里的人设。只在 API 调用时跑 —— 不进 2 秒轮询，目录扫描不该按轮询频率发生。 */
+function listPersonas(config) {
+  const dir = personasDirOf(config)
+  const catalog = readCatalog(config)
+  let names = []
+  try {
+    names = fs.readdirSync(dir, { withFileTypes: true })
+      .filter((entry) => entry.isDirectory() && !entry.name.startsWith('_') && isValidPersonaId(entry.name))
+      .map((entry) => entry.name)
+      .sort()
+  } catch { /* 目录还不存在：库是空的，不是错误 */ }
+  return names.map((id) => {
+    const file = personaFileOf(config, id)
+    let bytes = 0
+    let mtime = 0
+    try { const stat = fs.statSync(file); bytes = stat.size; mtime = stat.mtimeMs } catch { /* 缺 person.md */ }
+    const meta = catalog.get(id) ?? {}
+    return {
+      id,
+      name: typeof meta.displayName === 'string' ? meta.displayName : id,
+      tagline: typeof meta.tagline === 'string' ? meta.tagline : '',
+      tags: Array.isArray(meta.tags) ? meta.tags : [],
+      emoji: typeof meta.emoji === 'string' ? meta.emoji : '',
+      accent: typeof meta.accent === 'string' ? meta.accent : '',
+      bytes,
+      mtime,
+      valid: bytes > 0,
+    }
+  })
+}
+
+/** 解析人设段该读哪个文件 → { file, kind, id }。 */
+function resolvePersonaTarget(config, active) {
+  if (active.persona !== LEGACY_ID) {
+    const file = personaFileOf(config, active.persona)
+    if (fs.existsSync(file)) return { file, kind: 'library', id: active.persona }
+  }
+  return { file: path.join(armorDir(), 'persona.md'), kind: LEGACY_ID, id: LEGACY_ID }
+}
+
+function bundledPersona() {
+  try {
+    return { text: fs.readFileSync(bundled('./personas/default.md'), 'utf8'), src: '内置默认 ./personas/default.md' }
+  } catch {
+    return { text: '', src: '无内容' }
+  }
+}
+
+/**
+ * 读人设。ownText 与 text 分开存：
+ *   ownText = 角色正文（面板编辑与保存的对象）
+ *   text    = 真正注入模型的东西（库模式下 = _base + ownText）
+ * legacy 模式不拼 _base，所以升级后默认输出与旧版逐字节相同。
+ */
+function readPersona(config, active) {
+  const inline = typeof config.persona === 'string' && config.persona.trim()
+  if (inline) {
+    return { ownText: config.persona, text: config.persona, file: '', src: 'YAML 内联 config.persona', inline: true, kind: 'inline', id: '', persisted: false, baseFile: '', baseBytes: 0 }
+  }
+
+  let target = config.personaFile
+    ? { file: path.resolve(config.personaFile), kind: 'file', id: '' }
+    : resolvePersonaTarget(config, active)
+
+  let ownText = null
+  try { ownText = fs.readFileSync(target.file, 'utf8') } catch { ownText = null }
+
+  if (ownText === null) {
+    const legacyFile = path.join(armorDir(), 'persona.md')
+    try {
+      ownText = fs.readFileSync(legacyFile, 'utf8')
+      target = { file: legacyFile, kind: LEGACY_ID, id: LEGACY_ID }
+    } catch {
+      const fallback = bundledPersona()
+      return { ownText: fallback.text, text: fallback.text, file: legacyFile, src: fallback.src, inline: false, kind: 'bundled', id: '', persisted: false, baseFile: '', baseBytes: 0 }
+    }
+  }
+
+  const base = target.kind === 'library' ? readBaseFragment(config) : { text: '', file: '' }
+  const text = base.text.trim() ? `${base.text.trimEnd()}\n\n${ownText.trimEnd()}\n` : ownText
+  return {
+    ownText,
+    text,
+    file: target.file,
+    src: target.file,
+    inline: false,
+    kind: target.kind,
+    id: target.id,
+    persisted: true,
+    baseFile: base.file,
+    baseBytes: Buffer.byteLength(base.text, 'utf8'),
+  }
+}
+
+// ── 最小插值：只为「人设不用手写死路径」服务 ────────────────────────────
+//  刻意不用宿主插值：宿主的 renderPrompt 是严格模式，未知引用、已注册但无值的引用都会抛错，
+//  整轮请求直接失败；而人设是随手写的 markdown，出现 {{...}} 的概率不低。
+//  这里未知引用一律原样保留，替换只做一轮、不递归。
+function expandVars(text, context, config) {
+  if (config.interpolateVars === false || !text) return text
+  const agent = (context && context.agent) || null
+  const cwd = (agent && agent.session && agent.session.header && agent.session.header.cwd) || process.cwd()
+  const model = (agent && agent.options && agent.options.model) || ''
+  const now = new Date()
+  const pad = (n) => String(n).padStart(2, '0')
+  const values = {
+    cwd: String(cwd),
+    model: String(model),
+    home: armorDir(),
+    date: `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())}`,
+  }
+  return text.replace(/\{\{([a-z][a-z0-9_]*)\}\}/g, (match, name) => (
+    Object.prototype.hasOwnProperty.call(values, name) ? values[name] : match
+  ))
+}
+
+/** 移入 armor\trash\（应用级回收站，可手动还原）。插件运行时不做真删除。 */
+function moveToTrash(config, id) {
+  const from = path.join(personasDirOf(config), id)
+  const stamp = new Date().toISOString().replace(/[:.]/g, '-')
+  const to = path.join(armorDir(), 'trash', `${stamp}-${id}`)
+  fs.mkdirSync(path.dirname(to), { recursive: true })
+  fs.renameSync(from, to)
+  return to
+}
+
+function createPersona(config, id, from) {
+  const dir = path.join(personasDirOf(config), id)
+  if (fs.existsSync(dir)) throw new Error(`已存在：${dir}`)
+  fs.mkdirSync(dir, { recursive: true })
+  const source = from && isValidPersonaId(from)
+    ? personaFileOf(config, from)
+    : path.join(personasDirOf(config), '_template', 'persona.md')
+  // 回退链：用户库的 _template → 插件内置模板 → 硬编码最小骨架。
+  // 少了中间这层，换个环境装插件就会退化成一段没有写作规范的裸骨架。
+  let body
+  try {
+    body = fs.readFileSync(source, 'utf8')
+  } catch {
+    try {
+      body = fs.readFileSync(bundled('./personas/_template/persona.md'), 'utf8')
+    } catch {
+      body = `你是「${id}」，{一句话身份}。工作目录是 {{cwd}}。\n\n【身份】\n【人设】\n【口头禅】\n【行为模式】\n【反差萌】\n【思考模式】\n【表达技巧】\n【调节底线】\n【工作守则】\n`
+    }
+  }
+  const meta = {
+    schema: 1,
+    id,
+    displayName: id,
+    note: '段顺序不在本文件：order 只由 cordis.patch.yml 的 personaOrder 决定。',
+    createdAt: new Date().toISOString(),
+  }
+  fs.writeFileSync(path.join(dir, 'persona.md'), body, 'utf8')
+  fs.writeFileSync(path.join(dir, 'meta.json'), `${JSON.stringify(meta, null, 2)}\n`, 'utf8')
+  return { dir, file: path.join(dir, 'persona.md'), source }
 }
 
 function normalizeRules(list) {
@@ -253,7 +497,9 @@ function normalizeHardStop(list) {
 }
 
 // ── 侧栏面板的数据面：同源于宿主 webServer（与 dshmarket 同款接法）──────
-function mountApi(hostCtx, state, slots, config, log) {
+//  active 是从 apply() 传进来的可变指针对象（属性会被 /activate 与轮询改写），
+//  不能靠闭包捕获 —— mountApi 是模块级函数，拿不到 apply 里的局部变量。
+function mountApi(hostCtx, state, slots, config, log, active) {
   const readJson = (req) => new Promise((resolve) => {
     let raw = ''
     req.on('data', (chunk) => {
@@ -280,13 +526,26 @@ function mountApi(hostCtx, state, slots, config, log) {
   const describe = (slot) => {
     if (!slot) return { text: '', path: '', source: '', persisted: false, inline: false, bytes: 0 }
     const persisted = fs.existsSync(slot.watchFile)
+    // compose 段（人设）返回的是角色正文，不含 _base —— 面板存回去才不会把 base 抄进角色文件
+    const body = slot.spec.compose ? slot.ownText : slot.text
     return {
-      text: slot.text,
+      text: body,
       path: slot.watchFile,
       source: persisted ? slot.watchFile : slot.src,
       persisted,
       inline: slot.inline,
-      bytes: Buffer.byteLength(slot.text, 'utf8'),
+      bytes: Buffer.byteLength(body, 'utf8'),
+      ...(slot.spec.compose
+        ? {
+            kind: slot.kind,
+            id: slot.id,
+            composed: {
+              baseFile: slot.baseFile,
+              baseBytes: slot.baseBytes,
+              totalBytes: Buffer.byteLength(slot.text, 'utf8'),
+            },
+          }
+        : {}),
     }
   }
 
@@ -303,6 +562,12 @@ function mountApi(hostCtx, state, slots, config, log) {
         continueMax: clampCount(config.autoContinueMax, 3, 20),
         persona: describe(slotOf('persona')),
         rules: describe(slotOf('rules')),
+        active: { persona: active.persona },
+        personas: {
+          dir: personasDirOf(config),
+          activeFile: activeFileOf(config),
+          available: listPersonas(config),
+        },
       })
     }],
 
@@ -314,16 +579,36 @@ function mountApi(hostCtx, state, slots, config, log) {
       }
       const slot = slotOf(body.which)
       if (!slot) return sendJson(res, 400, { error: `未知目标 ${JSON.stringify(body.which)}` })
+      // 可选 id：写库里指定那份（面板切到别的人设后，编辑的可能是非 active 的那份）
+      let file = slot.watchFile
+      if (typeof body.id === 'string' && body.id) {
+        if (!slot.spec.compose) return sendJson(res, 400, { error: `${body.which} 段不支持 id` })
+        if (!isValidPersonaId(body.id)) return sendJson(res, 400, { error: `非法人设 id：${JSON.stringify(body.id)}` })
+        file = personaFileOf(config, body.id)
+      }
       try {
-        fs.mkdirSync(path.dirname(slot.watchFile), { recursive: true })
-        fs.writeFileSync(slot.watchFile, body.text, 'utf8')
+        fs.mkdirSync(path.dirname(file), { recursive: true })
+        // 原子写：人设是注入文本，半截文件会让模型读到被截断的指令
+        const tmp = `${file}.tmp`
+        fs.writeFileSync(tmp, body.text, 'utf8')
+        fs.renameSync(tmp, file)
         // 立刻生效，不等下一次轮询；并让位给文件（内联值不再优先）
-        slot.text = body.text
         slot.inline = false
-        slot.src = slot.watchFile
+        slot.src = file
+        slot.watchFile = file
+        if (slot.spec.compose) {
+          slot.ownText = body.text
+          // 只有库模式才拼 _base：legacy 下保存必须保持与旧版逐字节相同的输出
+          const base = slot.kind === 'library' ? readBaseFragment(config) : { text: '', file: '' }
+          slot.text = base.text.trim() ? `${base.text.trimEnd()}\n\n${body.text.trimEnd()}\n` : body.text
+          slot.baseFile = base.file
+          slot.baseBytes = Buffer.byteLength(base.text, 'utf8')
+        } else {
+          slot.text = body.text
+        }
         const bytes = Buffer.byteLength(body.text, 'utf8')
-        log(`${slot.spec.section} saved <- ${slot.watchFile} (${bytes} bytes)`)
-        sendJson(res, 200, { ok: true, path: slot.watchFile, bytes })
+        log(`${slot.spec.section} saved <- ${file} (${bytes} bytes)`)
+        sendJson(res, 200, { ok: true, path: file, bytes })
       } catch (e) {
         sendJson(res, 500, { error: String((e && e.message) || e) })
       }
@@ -349,6 +634,87 @@ function mountApi(hostCtx, state, slots, config, log) {
         persisted,
       })
     }],
+
+    // ── 人设库 ──────────────────────────────────────────────────────────
+    // 列表只在被调用时扫目录：目录扫描不进 2 秒轮询。
+    ['/dsh-armor/api/personas', async (req, res) => {
+      if (req.method !== 'GET') return sendJson(res, 405, { error: 'GET only' })
+      const base = readBaseFragment(config)
+      const legacyFile = path.join(armorDir(), 'persona.md')
+      sendJson(res, 200, {
+        active: { persona: active.persona },
+        dir: personasDirOf(config),
+        activeFile: activeFileOf(config),
+        base: { file: base.file, bytes: Buffer.byteLength(base.text, 'utf8') },
+        legacy: { file: legacyFile, exists: fs.existsSync(legacyFile) },
+        list: listPersonas(config),
+      })
+    }],
+
+    // 切换人设：写指针 + 立即重读，不等下一次轮询
+    ['/dsh-armor/api/activate', async (req, res) => {
+      if (req.method !== 'POST') return sendJson(res, 405, { error: 'POST only' })
+      const body = await readJson(req)
+      const id = body && typeof body.persona === 'string' ? body.persona : ''
+      if (id !== LEGACY_ID && !isValidPersonaId(id)) {
+        return sendJson(res, 400, { error: `非法人设 id：${JSON.stringify(id)}` })
+      }
+      if (id !== LEGACY_ID && !fs.existsSync(personaFileOf(config, id))) {
+        return sendJson(res, 404, { error: `人设不存在：${id}` })
+      }
+      active.persona = id
+      const persisted = saveActive(config, active)
+      const got = readPersona(config, active)
+      const slot = slotOf('persona')
+      if (slot) {
+        slot.ownText = got.ownText
+        slot.text = got.text
+        slot.watchFile = got.file
+        slot.src = got.src
+        slot.kind = got.kind
+        slot.id = got.id
+        slot.baseFile = got.baseFile
+        slot.baseBytes = got.baseBytes
+      }
+      log(`active.persona -> ${id} (persisted=${persisted})`)
+      sendJson(res, 200, { ok: true, active: { persona: id }, persisted, persona: describe(slot) })
+    }],
+
+    ['/dsh-armor/api/persona/create', async (req, res) => {
+      if (req.method !== 'POST') return sendJson(res, 405, { error: 'POST only' })
+      const body = await readJson(req)
+      if (!body || !isValidPersonaId(body.id)) {
+        return sendJson(res, 400, { error: '需要 { id: 小写 ASCII 标识, from?: 已有 id }' })
+      }
+      try {
+        const created = createPersona(config, body.id, body.from)
+        log(`persona created <- ${created.file} (来源 ${created.source})`)
+        sendJson(res, 200, { ok: true, ...created, list: listPersonas(config) })
+      } catch (e) {
+        sendJson(res, 409, { error: String((e && e.message) || e) })
+      }
+    }],
+
+    // 移入 armor\trash\（应用级回收站）——插件运行时不做真删除
+    ['/dsh-armor/api/persona/remove', async (req, res) => {
+      if (req.method !== 'POST') return sendJson(res, 405, { error: 'POST only' })
+      const body = await readJson(req)
+      if (!body || !isValidPersonaId(body.id)) {
+        return sendJson(res, 400, { error: '需要 { id: 小写 ASCII 标识 }' })
+      }
+      if (body.id === active.persona) {
+        return sendJson(res, 409, { error: `${body.id} 正在使用中，先切到别的再移走` })
+      }
+      const from = path.join(personasDirOf(config), body.id)
+      if (!fs.existsSync(from)) return sendJson(res, 404, { error: `人设不存在：${body.id}` })
+      try {
+        const trashed = moveToTrash(config, body.id)
+        log(`persona trashed <- ${trashed}`)
+        sendJson(res, 200, { ok: true, trashed, list: listPersonas(config) })
+      } catch (e) {
+        sendJson(res, 500, { error: String((e && e.message) || e) })
+      }
+    }],
   ]
 
   const disposers = routes.map(([routePath, handler]) => hostCtx.webServer.register({
@@ -370,8 +736,25 @@ export function apply(ctx, rawConfig) {
   const log = (...args) => { if (config.verbose) console.log('[armor-lite]', ...args) }
 
   const state = loadState()
+  const active = loadActive(config)
 
   const slots = SECTION_SPECS.map((spec) => {
+    if (spec.compose) {
+      const got = readPersona(config, active)
+      log(`${spec.section} <- ${got.src} (${got.text.length} chars, kind=${got.kind})`)
+      return {
+        spec,
+        watchFile: got.file,
+        inline: got.inline,
+        ownText: got.ownText,
+        text: got.text,
+        src: got.src,
+        kind: got.kind,
+        id: got.id,
+        baseFile: got.baseFile,
+        baseBytes: got.baseBytes,
+      }
+    }
     const inline = typeof config[spec.key] === 'string' && config[spec.key].trim()
     const custom = config[`${spec.key}File`]
     const watchFile = custom ? path.resolve(custom) : path.join(armorDir(), spec.defaultFile)
@@ -387,7 +770,9 @@ export function apply(ctx, rawConfig) {
       name: slot.spec.section,
       order: config[slot.spec.orderKey],
       interpolate: false,
-      text: () => (state.armed ? slot.text : ''),
+      // 段文本收 context：compose 段（人设）用它做 {{cwd}}/{{model}} 替换。
+      // 保持 interpolate:false 是刻意的 —— 宿主插值遇未知引用会抛错、整轮失败。
+      text: (context) => (state.armed ? (slot.spec.compose ? expandVars(slot.text, context, config) : slot.text) : ''),
     })
   }
 
@@ -426,8 +811,30 @@ export function apply(ctx, rawConfig) {
   if (config.watch !== false) {
     ctx.effect(() => {
       const timer = setInterval(() => {
+        // 先看激活指针：手改 active.json 也该在 2 秒内生效，不用等重启
+        const nextActive = loadActive(config)
+        if (nextActive.persona !== active.persona) {
+          active.persona = nextActive.persona
+          log(`active.persona -> ${active.persona}`)
+        }
         for (const slot of slots) {
           if (slot.inline) continue
+          if (slot.spec.compose) {
+            // 人设段：指针 / _base / 角色文件任一变化都要重算（readPersona 每次把两个文件读一遍）
+            const got = readPersona(config, active)
+            if (got.text !== slot.text || got.file !== slot.watchFile || got.kind !== slot.kind) {
+              slot.ownText = got.ownText
+              slot.text = got.text
+              slot.watchFile = got.file
+              slot.src = got.src
+              slot.kind = got.kind
+              slot.id = got.id
+              slot.baseFile = got.baseFile
+              slot.baseBytes = got.baseBytes
+              log(`${slot.spec.section} reloaded <- ${got.src} (kind=${got.kind})`)
+            }
+            continue
+          }
           try {
             const next = fs.readFileSync(slot.watchFile, 'utf8')
             if (next !== slot.text) {
@@ -446,7 +853,7 @@ export function apply(ctx, rawConfig) {
   // 5) 侧栏面板的数据面：宿主有 webServer 才挂；headless 下插件照常工作
   ctx.inject(['webServer'], (hostCtx) => {
     hostCtx.effect(
-      () => mountApi(hostCtx, state, slots, config, log),
+      () => mountApi(hostCtx, state, slots, config, log, active),
       'armor-lite: panel api routes',
     )
   })

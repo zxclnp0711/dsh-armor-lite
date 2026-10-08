@@ -21,9 +21,11 @@
         enabled: true
 
         # ── 人设与本地规则：文本一律从 $DSH_HOME\armor\*.md 读，不放这里 ──
-        # 默认路径：
-        #   $DSH_HOME\armor\persona.md   → 段 armor:persona（order -1500，永远第一段）
-        #   $DSH_HOME\armor\rules.md     → 段 armor:rules（order -1400，紧跟其后）
+        # 人设段取值优先级：内联 persona → personaFile → 人设库（active.json 指向的
+        #   personas\<id>\persona.md，库模式会前置 personas\_base\hard-rules.md）
+        #   → legacy（$DSH_HOME\armor\persona.md）→ 内置 personas\default.md
+        # 规则段不进库（本机 Windows 写法 / 服务器 Linux 写法，同一份内容不通用）：
+        #   $DSH_HOME\armor\rules.md → 段 armor:rules（order -1400，紧跟人设之后）
         # 两个文件都可以在侧栏「破甲」面板里直接改、直接存。
         persona: ''
         personaFile: ''
@@ -31,6 +33,16 @@
         rules: ''
         rulesFile: ''
         rulesOrder: -1400
+
+        # ── 人设库 ──
+        # 留空即默认：$DSH_HOME\armor\personas 与 $DSH_HOME\armor\active.json
+        personaDir: ''
+        activeFile: ''
+        # 硬约束片段目录（相对 personaDir）：'default' = _base；'' = 不拼
+        baseFragment: 'default'
+        # {{cwd}} / {{model}} / {{home}} / {{date}} 的最小替换；未知 {{...}} 原样保留
+        # （刻意不用宿主插值：它对未知引用直接抛错，整轮请求会失败）
+        interpolateVars: true
 
         # ── 组装后改写（最后一句话权）──
         strip: true

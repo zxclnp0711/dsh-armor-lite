@@ -122,6 +122,64 @@ window.__ModuleLoader__.load({
       )
     }
 
+    // 人设库选择器。刻意不用 window.prompt —— Electron 渲染进程里它不可用，改成内联小表单。
+    function PersonaPicker({ data, busy, onActivate, onCreate, onRemove }) {
+      const [open, setOpen] = React.useState(false)
+      const [draft, setDraft] = React.useState('')
+      const current = (data.active && data.active.persona) || 'legacy'
+      const available = (data.personas && data.personas.available) || []
+      const options = [{ id: 'legacy', name: 'legacy · 直读 armor\\persona.md' }]
+        .concat(available.map((p) => ({
+          id: p.id,
+          name: `${p.emoji ? `${p.emoji} ` : ''}${p.name} · ${p.bytes}B${p.valid === false ? ' · 缺 persona.md' : ''}`,
+        })))
+      const idOk = /^[a-z0-9][a-z0-9._-]{0,63}$/.test(draft)
+      return h('section', { style: { marginTop: 26 } },
+        h('div', { style: { display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap' } },
+          h('h3', { style: { margin: 0, fontSize: 15, fontWeight: 700, color: T.label } }, '人设库'),
+          h('span', { style: { fontSize: 12, color: T.label2 } },
+            '选一份注入；legacy = 直读 armor\\persona.md'),
+          h('span', { style: { flex: 1 } }),
+          h('select', {
+            value: current,
+            disabled: !!busy,
+            onChange: (e) => onActivate(e.target.value),
+            style: {
+              padding: '6px 10px', borderRadius: 8, fontSize: 13, fontWeight: 600,
+              fontFamily: 'inherit', cursor: busy ? 'wait' : 'pointer',
+              color: T.label, background: T.layer1, border: `1px solid ${T.border}`,
+            },
+          }, options.map((o) => h('option', { key: o.id, value: o.id }, o.name))),
+          h(Btn, { onClick: () => setOpen((v) => !v), disabled: !!busy }, open ? '取消' : '新建副本'),
+          current !== 'legacy'
+            ? h(Btn, { onClick: () => onRemove(current), disabled: !!busy }, '移走')
+            : null,
+        ),
+        open
+          ? h('div', { style: { marginTop: 10, display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' } },
+              h('input', {
+                value: draft,
+                placeholder: '新 id：小写 ASCII，如 asuka',
+                spellCheck: false,
+                onChange: (e) => setDraft(e.target.value),
+                style: {
+                  padding: '6px 10px', borderRadius: 8, fontSize: 13, width: 240,
+                  fontFamily: 'ui-monospace, SFMono-Regular, Consolas, monospace',
+                  color: T.label, background: T.layer1, border: `1px solid ${T.border}`, outline: 'none',
+                },
+              }),
+              h(Btn, {
+                primary: true,
+                disabled: !!busy || !idOk,
+                onClick: () => { onCreate(draft); setDraft(''); setOpen(false) },
+              }, '创建'),
+              h('span', { style: { fontSize: 11.5, color: draft && !idOk ? T.err : T.label2 } },
+                draft && !idOk ? 'id 只能是小写字母/数字/._-，且以字母或数字开头' : '从 _template 复制一份骨架'),
+            )
+          : null,
+      )
+    }
+
     // ── 面板 ──────────────────────────────────────────────────────────
     function ArmorPanel() {
       const [data, setData] = React.useState(null)
@@ -163,6 +221,62 @@ window.__ModuleLoader__.load({
           setData((s) => (s ? { ...s, [which]: { ...s[which], text, bytes: body.bytes, source: body.path, persisted: true } } : s))
         } catch (e) {
           if (alive.current) setNote({ kind: 'err', text: `保存失败：${e.message}` })
+        } finally {
+          if (alive.current) setBusy('')
+        }
+      }
+
+      // 只刷人设列表，不动 note（load() 会清掉提示）
+      const refreshList = async () => {
+        try {
+          const body = await call('/personas')
+          if (!alive.current) return
+          setData((s) => (s
+            ? { ...s, active: body.active, personas: { ...(s.personas || {}), dir: body.dir, activeFile: body.activeFile, available: body.list } }
+            : s))
+        } catch { /* 列表刷新失败不影响主流程 */ }
+      }
+
+      const activate = async (id) => {
+        setBusy('activate')
+        try {
+          const body = await postJson('/activate', { persona: id })
+          if (!alive.current) return
+          setData((s) => (s ? { ...s, active: body.active, persona: body.persona } : s))
+          setPersona((body.persona && body.persona.text) || '')
+          setDirty((d) => ({ ...d, persona: false }))
+          const label = id === 'legacy' ? 'legacy（直读 armor\\persona.md）' : id
+          setNote({ kind: 'ok', text: `已切到 ${label}，下一次请求即生效。` })
+        } catch (e) {
+          if (alive.current) setNote({ kind: 'err', text: `切换失败：${e.message}` })
+        } finally {
+          if (alive.current) setBusy('')
+        }
+      }
+
+      const createPersona = async (id) => {
+        setBusy('create')
+        try {
+          const body = await postJson('/persona/create', { id })
+          if (!alive.current) return
+          setNote({ kind: 'ok', text: `已建 ${body.file}（来源 ${body.source}）。填好人设后在左侧下拉里选它。` })
+          await refreshList()
+        } catch (e) {
+          if (alive.current) setNote({ kind: 'err', text: `新建失败：${e.message}` })
+        } finally {
+          if (alive.current) setBusy('')
+        }
+      }
+
+      const removePersona = async (id) => {
+        setBusy('remove')
+        try {
+          const body = await postJson('/persona/remove', { id })
+          if (!alive.current) return
+          setNote({ kind: 'warn', text: `已把 ${id} 移入 ${body.trashed}（没有真删除，可手动还原）。` })
+          await refreshList()
+        } catch (e) {
+          if (alive.current) setNote({ kind: 'err', text: `移走失败：${e.message}` })
         } finally {
           if (alive.current) setBusy('')
         }
@@ -217,9 +331,18 @@ window.__ModuleLoader__.load({
       }
 
       const tone = note ? (note.kind === 'ok' ? T.ok : note.kind === 'warn' ? T.warn : T.err) : T.label2
-      const metaOf = (slot) => `${slot.source || slot.path || '(未知来源)'} · ${slot.bytes} 字节`
-        + (slot.persisted === false ? ' · 尚未落盘，保存后写入该路径' : '')
-        + (slot.inline ? ' · 来自 YAML 内联值（保存后改写到文件）' : '')
+      const metaOf = (slot) => {
+        const parts = [`${slot.source || slot.path || '(未知来源)'} · ${slot.bytes} 字节`]
+        if (slot.persisted === false) parts.push('尚未落盘，保存后写入该路径')
+        if (slot.inline) parts.push('来自 YAML 内联值（保存后改写到文件）')
+        if (slot.kind === 'library') parts.push(`库模式 · ${slot.id}`)
+        if (slot.kind === 'legacy') parts.push('legacy 直读')
+        if (slot.kind === 'bundled') parts.push('内置兜底')
+        if (slot.composed && slot.composed.baseBytes > 0) {
+          parts.push(`注入时前置 _base ${slot.composed.baseBytes} 字节 → 合计 ${slot.composed.totalBytes} 字节`)
+        }
+        return parts.join(' · ')
+      }
       const personaMeta = metaOf(data.persona)
       const rulesMeta = metaOf(data.rules)
 
@@ -246,7 +369,7 @@ window.__ModuleLoader__.load({
           h('div', {}, '段顺序：armor:persona (-1500) → armor:rules (-1400) → 第一方指导'),
           h('div', {}, '剔除的身份段：harness:identity、deployment:persona-prefix'),
           h('div', {}, `文件目录：${data.home}`),
-          h('div', {}, `外部直接改人设/规则文件会在 ${data.watchIntervalMs || 2000} ms 内被读到；三个开关写在 state.json，重启后保持（外部改那个文件要重启才读）。`),
+          h('div', {}, `外部直接改人设/规则文件会在 ${data.watchIntervalMs || 2000} ms 内被读到；三个开关写在 state.json，当前人设写在 active.json —— 重启后都保持（外部直接改 state.json 要重启才读，改 active.json 不用）。`),
         ),
 
         h('div', {
@@ -279,9 +402,20 @@ window.__ModuleLoader__.load({
           style: { marginTop: 14, fontSize: 12.5, color: tone, lineHeight: 1.6 },
         }, note.text) : null,
 
+        h(PersonaPicker, {
+          key: 'personas',
+          data, busy,
+          onActivate: (id) => void activate(id),
+          onCreate: (id) => void createPersona(id),
+          onRemove: (id) => void removePersona(id),
+        }),
+
         h(Editor, {
           key: 'persona',
-          title: '人设', hint: '段 armor:persona，排在最前，永远先于第一方指导',
+          title: '人设正文',
+          hint: (data.persona && data.persona.kind === 'library')
+            ? `库里这一份（保存写它；_base 不在这里）`
+            : '段 armor:persona，排在最前，永远先于第一方指导',
           value: persona, meta: personaMeta, dirty: dirty.persona, busy,
           onChange: (v) => { setPersona(v); setDirty((d) => ({ ...d, persona: true })) },
           onSave: () => void save('persona'),

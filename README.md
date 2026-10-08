@@ -2,9 +2,10 @@
 
 DeepSeek Harness 的**轻量破甲插件**：只改运行时，不改任何官方文件。
 
-- **体量**：8 个文件、零 `@deepseek-ai/*` 运行时依赖（只声明 peerDep `cordis`）
+- **体量**：9 个源文件 + 一套人设库、零 `@deepseek-ai/*` 运行时依赖（只声明 peerDep `cordis`）
 - **破甲方式**：`system-prompt/assemble` 瀑布最外层改写 + 按段名剔除固定身份开场白 + 前置自定义人设/规则
-- **人设与规则**：纯 markdown 文件，2 秒热生效，也可在侧栏图形面板里改
+- **人设库**：多套人设并存，下拉即切；硬约束片段自动前置；`{{cwd}}` 等最小插值（未知引用原样保留，不报错）
+- **规则**：单份 markdown（刻意不进库），2 秒热生效，也可在侧栏图形面板里改
 - **拒答恢复**：一轮正常收尾但内容是拒答时自动补话顶回去；被 max-tokens 截断时自动续写（事件层，可关）
 - **官方更新免疫**：不发一个补丁到 `node_modules`，官方覆盖文件也打不回来
 
@@ -32,9 +33,14 @@ dsh-armor-lite/
 ├─ client.js             # Client 半：侧栏「破甲」入口 + 中央面板（React，无 Harness 客户端包依赖）
 ├─ strip-rules.js        # 削减文案改写表（可自由增删）
 ├─ refusal-recover.js    # 拒答自动恢复 + 空转续写（纯事件层，不碰提示词）
-└─ personas/
-   ├─ default.md         # 人设段的内置默认（\$DSH_HOME/armor/persona.md 不存在时用它）
-   └─ default-rules.md   # 规则段的内置默认
+├─ personas/
+│  ├─ default.md         # 人设段的内置兜底（legacy 文件与库都没有时用它）
+│  ├─ default-base.md    # 硬约束片段的兜底（用户没建 personas\_base\hard-rules.md 时用它）
+│  └─ default-rules.md   # 规则段的内置默认
+└─ tools/
+   ├─ selftest.mjs       # 离线自测（89 项，不动真实 $DSH_HOME）
+   ├─ persona-lint.mjs   # 人设结构检查（首行 + 9 段 / 口头禅条数 / 尺寸 / 变量）
+   └─ dump-prompt.mjs    # 从会话日志里捞出渲染后的系统提示词
 ```
 
 ## 四个工作机制
@@ -55,16 +61,48 @@ dsh-armor-lite/
 
 > 行按 id 覆盖**整行 config**（非深度合并），所以原行已有的字段要一并写回。
 
-### 2. 人设段 + 规则段
+### 2. 人设库 + 规则段
 
 两段注册在 `order -1500 / -1400`，都低于 harness 身份的 `-1000`，因此**永远排在第一方指导之前**：
 
-| 段名 | 文件 | order |
+| 段名 | 内容来源 | order |
 |---|---|---|
-| `armor:persona` | `$DSH_HOME/armor/persona.md` | -1500 |
-| `armor:rules` | `$DSH_HOME/armor/rules.md` | -1400 |
+| `armor:persona` | 人设库（优先级见下表） | -1500 |
+| `armor:rules` | `$DSH_HOME/armor/rules.md`（单份） | -1400 |
 
-段文本是函数，每次组装重新求值 → 改文件即时生效，不需要重启。插件同时以 2 秒轮询兜底（能覆盖"文件还不存在 → 被创建"的情况）。
+`armor:rules` 刻意保持单文件、不进库：本机的 rules 是 Windows 写法（回收站、7890 代理、引号路径），
+服务器那份是 Linux 写法（`/opt/trash`、mihomo、`/usr/bin/curl`）—— 同一份内容不通用，进库只会让两端互相覆盖。
+
+**人设段的取值优先级**（命中就停）：
+
+| 序 | 来源 | 说明 |
+|---|---|---|
+| ① | `config.persona` | YAML 内联，逃生舱；命中后该段不进热更新 |
+| ② | `config.personaFile` | 显式路径 |
+| ③ | `active.json` 指向的 `personas/<id>/persona.md` | **库模式**：前面会拼上 `personas/_base/hard-rules.md` |
+| ④ | `$DSH_HOME/armor/persona.md` | `legacy`：不拼 `_base`，输出与 0.3.0 逐字节相同 |
+| ⑤ | 内置 `personas/default.md` | 兜底 |
+
+**库模式下的段文本 = `_base/hard-rules.md` + 角色正文**。这一层是"换角色不丢硬约束"的保证。
+面板里编辑的**只有角色正文**，`_base` 只读展示 —— 否则保存一次就把 `_base` 抄进角色文件，之后越拼越长。
+
+指针文件（默认就是 `legacy`）：
+
+```json
+{ "schema": 1, "persona": "jinzhien", "updatedAt": "2026-10-08T18:50:00.000Z" }
+```
+
+指针缺失 / JSON 坏 / id 非法 / 目录不存在 → 一律回落 `legacy` 且**不抛错**。宁可少做事，也不能因为一个坏 JSON 把人设整段清空。
+
+**最小插值**：`{{cwd}}`、`{{model}}`、`{{home}}`、`{{date}}`，由本插件替换，段本身仍是 `interpolate: false`。
+
+为什么不用宿主插值：宿主 `renderPrompt()` 是严格模式 —— **未知引用、已注册但无值的引用、格式错误的完整组都会抛错**，
+整轮请求直接失败。而人设是随手写的 markdown，出现 `{{...}}`（贴 Jinja / Handlebars / 文档示例）的概率不低。
+这里未知引用一律**原样保留**。取值与宿主同源：`cwd` = `context.agent.session.header.cwd`、`model` = `context.agent.options.model`
+（`SystemPrompt.assemble()` 里段文本函数会收到 `context`，所以不必开插值也能拿到）。
+
+段文本是函数、每次组装重新求值 → 改文件即时生效，不需要重启。2 秒轮询兜底"文件还不存在 → 被创建"，
+并且**同时盯着 `active.json`** —— 手改指针同样 2 秒生效。
 
 ### 3. 组装后改写（拥有最后一句话权）
 
@@ -121,19 +159,26 @@ ctx.on('agent/status', (payload) => {
 
 | 功能 | 行为 |
 |---|---|
-| 人设 | 读 / 改 / 保存 → `$DSH_HOME/armor/persona.md` |
-| 规则 | 读 / 改 / 保存 → `$DSH_HOME/armor/rules.md` |
+| 人设库 | 下拉切换（`legacy` 或库里的某一份）、新建副本（从 `_template` 复制）、移走（进 `armor\trash\`，不做真删除） |
+| 人设正文 | 读 / 改 / 保存 → 当前生效的那份；库模式下是 `personas/<id>/persona.md`，`_base` 只读前置、不在编辑框里 |
+| 规则 | 读 / 改 / 保存 → `$DSH_HOME/armor/rules.md`（单份，不参与库） |
 | 破甲开关 | 关闭 = 两段清空 + 改写停用 + 身份开场白恢复 + 拒答恢复停用，即原版 DSH；状态持久化在 `armor/state.json` |
 | 拒答恢复 | 事件层开关，与破甲总开关联动（总开关关掉时它也停） |
 | 空转续写 | 事件层开关，同上 |
+
+人设那一行的来源提示会写清当前是 `库模式 · <id>` / `legacy 直读` / `内置兜底`，以及"注入时前置 `_base` N 字节 → 合计 M 字节"。
 
 面板与 Host 之间走同源 HTTP 桥（宿主 `webServer` 的 `kind: 'exact'` 路由）：
 
 | 路由 | 方法 | 说明 |
 |---|---|---|
-| `/dsh-armor/api/state` | GET | `{ armed, recover, continue, home, watchIntervalMs, recoverMax, continueMax, persona, rules }` |
-| `/dsh-armor/api/save` | POST | `{ which: 'persona'\|'rules', text }` → 写盘并立即生效 |
+| `/dsh-armor/api/state` | GET | 旧字段全保留：`{ armed, recover, continue, home, watchIntervalMs, recoverMax, continueMax, persona, rules }`；新增 `active: { persona }` 与 `personas: { dir, activeFile, available[] }`。`persona` 上多出 `kind` / `id` / `composed: { baseFile, baseBytes, totalBytes }` |
+| `/dsh-armor/api/save` | POST | `{ which: 'persona'\|'rules', text, id? }` → 写盘（临时文件 + rename）并立即生效；带 `id` 时写库里的那一份 |
 | `/dsh-armor/api/toggle` | POST | `{ enabled: boolean, key?: 'armed'\|'recover'\|'continue' }` → 切换并存 `state.json`；`key` 省略即 `armed`，旧调用照旧可用 |
+| `/dsh-armor/api/personas` | GET | `{ active, dir, activeFile, base, legacy, list[] }`；列表只在被调用时扫目录（不进 2 秒轮询） |
+| `/dsh-armor/api/activate` | POST | `{ persona: '<id>' \| 'legacy' }` → 写 `active.json` + 立即重读，不等轮询 |
+| `/dsh-armor/api/persona/create` | POST | `{ id, from? }` → 建目录、从 `_template`（或 `from`）复制 persona.md、生成 meta.json |
+| `/dsh-armor/api/persona/remove` | POST | `{ id }` → 移入 `armor\trash\<时间戳>-<id>\`（可手动还原）；正在使用中的那份拒绝移走 |
 
 ## 配置项（`cordis.patch.yml` 的 `config`）
 
@@ -141,7 +186,11 @@ ctx.on('agent/status', (payload) => {
 |---|---|---|
 | `enabled` | `true` | 插件是否加载（与面板里的破甲开关是两回事） |
 | `persona` / `rules` | `''` | 内联文本；非空时优先于文件，且关闭该段的热更新 |
-| `personaFile` / `rulesFile` | `''` | 留空则用 `$DSH_HOME/armor/{persona,rules}.md` |
+| `personaFile` / `rulesFile` | `''` | 留空则走人设库 / `$DSH_HOME/armor/{persona,rules}.md` |
+| `personaDir` | `''` | 人设库目录；留空 = `$DSH_HOME/armor/personas` |
+| `activeFile` | `''` | 激活指针；留空 = `$DSH_HOME/armor/active.json` |
+| `baseFragment` | `'default'` | 硬约束片段目录（相对 `personaDir`）；`'default'` = `_base`，`''` = 不拼 |
+| `interpolateVars` | `true` | `{{cwd}}`/`{{model}}`/`{{home}}`/`{{date}}` 的最小替换；未知引用原样保留 |
 | `personaOrder` / `rulesOrder` | `-1500` / `-1400` | 段顺序；必须低于 `-1000` 才能压过 harness 身份 |
 | `strip` | `true` | 是否启用组装后改写 |
 | `stripContexts` | `true` | 是否把改写也应用到动态 runtime 上下文 |
@@ -165,11 +214,16 @@ ctx.on('agent/status', (payload) => {
 
 ## 验证方法
 
-改完 `strip-rules.js` / `refusal-recover.js` 先跑离线自测 —— 它自己把 `DSH_HOME` 指到临时目录，不碰你的真实配置，也不用重启宿主：
+改完 `strip-rules.js` / `refusal-recover.js` / `index.js` 先跑离线自测 —— 它自己把 `DSH_HOME` 指到临时目录，不碰你的真实配置，也不用重启宿主：
 
 ```sh
-node tools/selftest.mjs        # 42 项，退出码非 0 表示有失败
+node tools/selftest.mjs                 # 89 项，退出码非 0 表示有失败
+node tools/persona-lint.mjs --legacy    # 人设结构检查（首行 + 9 段、口头禅条数、尺寸、变量）；有 error 时退出码 1
 ```
+
+自测里 `[9]`~`[14]` 是人设库那部分，其中两条是刻意钉死的纪律：
+`legacy` 默认必须与原文件**逐字节相同**；库模式的 `/state` 返回给面板的 `text` 只能是角色正文（不能含 `_base`）。
+改完记得做一次变异验证 —— 把库分支禁掉，那几条必须变红，否则说明这些用例测不到东西。
 
 宿主插件改动**必须重启**才生效；客户端改动刷新页面即可。验证最终渲染结果（这是模型真正看到的东西）：
 
@@ -180,6 +234,7 @@ node tools/selftest.mjs        # 42 项，退出码非 0 表示有失败
 > 注意取样范围：`role: "system"` 那条**只含 sections**。动态 runtime context（审批策略、文件策略那些）是 `agent/pre-step` 单独挂上去的另一条消息，不在 system 消息里 —— 要验证 contexts 的改写，得把那条消息也取出来看。
 
 期望：第一段是 `armor:persona` 的内容，紧随 `armor:rules`，且 `You are an AI agent powered by DeepSeek Harness` 与 `You are a coding agent powered by … model` **均为 0 命中**。
+库模式下 `armor:persona` 的开头应当是 `_base/hard-rules.md` 的内容（硬约束在前），角色正文紧随其后；`legacy` 模式下则与 `armor\persona.md` 逐字节相同。
 
 拒答恢复的验证不用等模型真拒答：在会话日志里找 `source.kind === "user"` 且文本等于 `refusalRecoverText`（或内置补话）的消息事件，有就说明补话路径通。开关关闭时该事件不应出现。
 
@@ -191,6 +246,11 @@ node tools/selftest.mjs        # 42 项，退出码非 0 表示有失败
 - `strip-rules.js` 中针对 `dsh-agent-instructions` 的三条规则，在该插件行被禁用时属于空转（无副作用），是留给该行被启用时的保险。
 - **`complete` 段的死角（宿主结构，改不掉）**：`SystemPrompt.assemble()` 在 `system-prompt/assemble` 瀑布返回之后还有一步强制覆盖 —— 只要合并后的段里存在任何 `complete: true`，最终 `sections` 会被替换成那一段，本插件的 `dropSections` / `replaceSections` / `stripRules` 全部作废（`contexts` 的改写不受影响）。当前现役 preset（redteam / seep / tongjiapo / krea2-unrestricted）都只用 `prefix`，不开 `complete`，所以不受影响。哪天用了开 `complete` 的 preset（老备份里的 minimal-v6 / qingyue-mother / anchored-standard 就是这种），改写会**静默失效**，没有报错。
 - 拒答识别是正则，不是分类器：正常回答里如果开头就有「抱歉 / 不能」这类词，可能被误判成拒答、多顶一轮。`refusalRecoverHeadLimit` 把判定面限制在开头，`hardStopPatterns` 用来排除刻意的闸门。真被误伤就把开关关掉。
+- **人设库的段顺序不按角色覆盖**（设计决定）：`order` 只由 `cordis.patch.yml` 的 `personaOrder` 决定，`meta.json` 里不许出现 `order`（`persona-lint.mjs` 会直接报 error）。理由是避免"两个真相源 + 改一个不生效"这类看不见的故障；角色若把 order 顶到 `-1000` 以上，破甲本身就失效了。
+- 面板下拉切换人设会覆盖当前未保存的编辑（靠标题旁的「· 未保存」提示）。库模式下编辑的始终是 `active` 那一份。
+- `_base/hard-rules.md` 是全局的：改它会影响库里**所有**人设。这是刻意的（硬约束不该随角色变），但要清楚它的作用面。
+- 人设库里没有多语言：一份人设一个文件，`id` 全 ASCII。要分语言就建两份人设（如 `jinzhien` / `jinzhien-ja`）。
+- 面板上的「移走」是把目录移进 `armor\trash\`，不是真删除；`trash` 目录不会自动清理。
 
 ## 环境
 
