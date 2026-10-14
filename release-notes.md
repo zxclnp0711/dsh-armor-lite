@@ -4,6 +4,16 @@
 
      本机没有 GITHUB_TOKEN / GH_TOKEN 时 --release 会明确报错，但 commit / push 照常完成。 -->
 
+## v0.4.5 — 人设跨段重复检测与人设库更新
+
+### v0.4.5 · `persona-lint.mjs` 跨段重复检测
+
+- **段间 6-gram 重合率检查**：抓出「结构全对、体积不超，但同一素材在多个段里重复写两遍」的隐性问题（重复会被模型读成权重加倍，挤占本该写在别处的表现）。
+- **分级阈值**：去除段头、空白与标点后计算字符 6-gram 重合率；`> 15%` 报 `warn`（最多展示前 3 对，超出折叠汇总以防公共套话刷屏），`8% ~ 15%` 报 `info` 提示最相近的一对供人工复核。
+- **工程维护**：`.gitignore` 新增 `backups/` 忽略规则，避免本地备份文件被发版脚本一并暂存。
+
+---
+
 ## v0.4.4 — 人设库
 
 这一版把「一份人设」变成「一套人设库」：多套并存、选中即预览、保存才生效，外加一份能再造人设的元提示词。
@@ -67,4 +77,4 @@
 - 面板「移走」是移进 `armor/trash/`，不是真删除；`trash` 不会自动清理。
 - 与 DSH 生态里其他酒馆类插件同装时注意**双重注入**：它们常自带 persona 段，而 `armor:persona` 是 global 段、优先级最前，同时用会注入两份人设。
 
-**Full Changelog**: https://github.com/zxclnp0711/dsh-armor-lite/compare/v0.3.0...v0.4.4
+**Full Changelog**: https://github.com/zxclnp0711/dsh-armor-lite/compare/v0.3.0...v0.4.5

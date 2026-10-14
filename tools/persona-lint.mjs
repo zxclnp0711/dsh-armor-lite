@@ -12,6 +12,8 @@
 //
 // 为什么要有它：人设漂掉往往不是模型的问题，是段缺失、口头禅不够、行为模式写成形容词。
 // 这些都能在离线静态检查里抓到，不必等到聊崩了才发现。
+// 跨段重复（同一素材写两遍）也算——它结构全对、体积也不超，只逐段看是发现不了的。
+// 重合率默认 NGRAM=6 字符、>15% 报 warn、>8% 报 info；要调就改 lintText 里那三个常量。
 
 import fs from 'node:fs'
 import os from 'node:os'
@@ -114,6 +116,55 @@ function lintText(text, label) {
     const start = found[index].at
     const end = index + 1 < found.length ? found[index + 1].at : text.length
     return text.slice(start, end)
+  }
+
+  // ── 跨段重复检测（结构检查看不见的那类问题）────────────────────────────
+  //  段齐全、顺序对、体积不超 —— 但同一素材写了两遍。后果不是浪费预算那么简单：
+  //  重复会被模型读成权重加倍，把本该写在别处的表现挤出去。
+  //  这里用字符 n-gram 比段间重合率：抓得住整句照抄，抓不住换了措辞的语义重复
+  //  —— 所以超过 info 线就把最像的那一对报出来，让作者自己去看一眼。
+  const NGRAM = 6
+  const OVERLAP_WARN = 0.15
+  const OVERLAP_INFO = 0.08
+  const MIN_SHINGLES = 8
+  const shinglesOf = (raw) => {
+    // 段名本身、空白、标点都不参与比对：标点会把无关的两段也一起拉高。
+    const body = raw.replace(/^[ \t]*【[^】\n]{1,12}】/, '').replace(/[\s\p{P}\p{S}]/gu, '')
+    const set = new Set()
+    for (let i = 0; i + NGRAM <= body.length; i += 1) set.add(body.slice(i, i + NGRAM))
+    return set
+  }
+  const sectionSets = found.map((entry, index) => {
+    const end = index + 1 < found.length ? found[index + 1].at : text.length
+    return { name: entry.name, set: shinglesOf(text.slice(entry.at, end)) }
+  })
+  const overlapHits = []
+  for (let i = 0; i < sectionSets.length; i += 1) {
+    for (let j = i + 1; j < sectionSets.length; j += 1) {
+      const a = sectionSets[i]
+      const b = sectionSets[j]
+      if (a.name === b.name) continue
+      if (a.set.size < MIN_SHINGLES || b.set.size < MIN_SHINGLES) continue
+      let shared = 0
+      for (const gram of a.set) if (b.set.has(gram)) shared += 1
+      overlapHits.push({ a: a.name, b: b.name, rate: shared / Math.min(a.set.size, b.set.size) })
+    }
+  }
+  overlapHits.sort((x, y) => y.rate - x.rate)
+  //  一句公共套话被 4 个段引用会炸出 6 对。只报最高的三对，其余折叠成一条 ——
+  //  否则真问题会被自己刷出来的噪音埋掉。
+  const MAX_OVERLAP_LINES = 3
+  for (const hit of overlapHits.slice(0, MAX_OVERLAP_LINES)) {
+    if (hit.rate <= OVERLAP_WARN) break
+    warns.push(`【${hit.a}】与【${hit.b}】正文重合 ${Math.round(hit.rate * 100)}%（>${Math.round(OVERLAP_WARN * 100)}%）—— 同一素材写两遍：模型读成权重加倍，还挤掉本该写在别处的内容`)
+  }
+  const overCount = overlapHits.filter((hit) => hit.rate > OVERLAP_WARN).length
+  if (overCount > MAX_OVERLAP_LINES) {
+    warns.push(`另有 ${overCount - MAX_OVERLAP_LINES} 对段也超线（多为同一句公共套话被多段引用）—— 一并清一遍`)
+  }
+  const top = overlapHits[0]
+  if (top && top.rate > OVERLAP_INFO && top.rate <= OVERLAP_WARN) {
+    infos.push(`最相近的两段：【${top.a}】与【${top.b}】重合 ${Math.round(top.rate * 100)}%（未超 ${Math.round(OVERLAP_WARN * 100)}%）—— 换了措辞的语义重复抓不到，值得人工看一眼`)
   }
 
   const catchphrase = pick('口头禅')
