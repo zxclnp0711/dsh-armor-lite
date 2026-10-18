@@ -44,15 +44,18 @@ export const DEFAULT_HARD_STOP = [
  *    否则「抱歉，我看错了，重跑一遍」会被当成拒答白顶一轮（自测里就是这么抓出来的）。
  */
 export const DEFAULT_REFUSAL = new RegExp(
-  String.raw`(?:^|[\s。！？!?、，,；;：:\n])` +
-  String.raw`(?:无法(?:协助|帮助|提供|完成|继续|满足|处理|参与|回答)|` +
-  String.raw`不能(?:帮助|协助|提供|直接|进行|参与|为您|为你|回答)|` +
-  String.raw`我(?:不能|无法|不会|不做|做不了|不参与|没办法)|` +
-  String.raw`恕难|不予(?:支持|提供|受理)|出于(?:安全|合规|伦理|政策)考量|未授权攻击|` +
-  String.raw`I\s*(?:can'?t|cannot|won'?t|will\s+not)|unable\s+to\s+(?:assist|help|comply)|` +
-  String.raw`sorry[,.\s]+I\s+(?:can'?t|cannot|won'?t)|` +
-  String.raw`(?:decline|refuse)\s+to\s+(?:assist|help|comply)|` +
-  String.raw`(?:don'?t|do\s+not)\s+(?:do|perform|help\s+with)\s+this)`,
+  [
+  "(?:^|[\\s。！？!?、，,；;：:\\n])(?:无法(?:协助|帮助|提供|完成|继续|满足|处理|参与|回答|给出|输出|支持)|不能(?:帮助|协助|提供|直接|进行|参与|为您|为你|回答|给出|输出|这样)|恕难|不予(?:支持|提供|受理)|出于(?:安全|合规|伦理|政策)考量|未授权攻击)",
+  "|我(?:不能|无法|不会|不做|不写|不给|不提供|不参与|不转述|没办法|做不了|写不了|给不了|帮不了|查不了|不会给|不会提供|无法提供|不能提供)",
+  "|这个(?:我)?(?:不能|不会|不做|不写|不给|做不了|写不了|给不了)",
+  "|这类(?:我)?(?:不做|不写|不给|不能|不提供)",
+  "|(?:^|[\\s。！？!?、，,；;：:\\n])(?:给不了|做不了|写不了|帮不了|查不到|办不到)",
+  "|I\\s*(?:can'?t|cannot|won'?t|will\\s+not)",
+  "|unable\\s+to\\s+(?:assist|help|comply)",
+  "|sorry[,.\\s]+I\\s+(?:can'?t|cannot|won'?t)",
+  "|(?:decline|refuse)\\s+to\\s+(?:assist|help|comply)",
+  "|(?:don'?t|do\\s+not)\\s+(?:do|perform|help\\s+with)\\s+this",
+  ].join(''),
   'iu',
 )
 

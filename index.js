@@ -1,15 +1,16 @@
-// dsh-armor-lite — 轻量破甲层（Host 半）
+// dsh-armor-lite — 轻量提示词增强层（Host 半）
 //
 // 设计要点：
 //  1. 不 import 任何 @deepseek-ai/* 运行时包（只声明 peerDep cordis），避免 profile 里
 //     resolve 不到 schemastery/tools；因此不导出 Config schema，配置由 normalize 处理。
 //  2. 人设 / 本地规则走 $DSH_HOME\armor\*.md 文件，段文本用函数，改文件下次组装即生效。
-//  3. 破甲靠 system-prompt/assemble 瀑布（{global:true, prepend:true} = 最外层），
-//     拿到的是各层处理完的最终 assembly，返回值就是交付给模型的提示词 —— 层序无关，
-//     官方更新覆盖文件也打不回来。
-//  4. 侧栏「破甲」面板（Client 半）通过 /dsh-armor/api/* 读写本文件持有的状态。
+//  3. 提示词增强靠 system-prompt/assemble 瀑布（{global:true, prepend:true} = 最外层）。
+//     v0.5.0 起改成「只追加不改写」：官方段一个字不动，提示词增强正文由 armor:execution-mode
+//     段插入（order 30，紧跟 deployment:persona-prefix）。改写层（strip/drop/replace）
+//     保留为可选开关，默认全关 —— 官方升级改措辞时本插件不会静默空转，也不会吞正文。
+//  4. 侧栏「提示词增强」面板（Client 半）通过 /dsh-armor/api/* 读写本文件持有的状态。
 //  5. 拒答自动恢复 / 空转续写走 refusal-recover.js（事件层：agent/status + agent.followup），
-//     与提示词组装无关，但受同一个破甲总开关约束 —— 破甲关掉它就跟着停。
+//     与提示词组装无关，但受同一个提示词增强总开关约束 —— 提示词增强关掉它就跟着停。
 //
 // 注意（宿主结构死角，复核时确认）：system-prompt 的 assemble() 在瀑布返回之后还有一步
 // 强制覆盖 —— 只要有任何一段带 complete:true，最终 sections 会被换成那一段，本插件的
@@ -37,7 +38,16 @@ const DEFAULTS = {
   // 人设段
   persona: '',
   personaFile: '',
-  personaOrder: -1500,
+  // v0.6.0：降级到 10/20，排在官方身份句(-1000)与 persona-prefix(0)之后。
+  // 旧值 -1500 是改写模式"抢位置"的残留；追加模式不需要抢。
+  personaOrder: 10,
+
+  // 执行契约段（追加层，等价 dsh-unrestricted 的 unrestricted:execution-mode）
+  //   正文走 $DSH_HOME\\armor\\execution-mode.md → 内置 personas/default-execution-mode.md
+  //   order 30：紧跟 deployment:persona-prefix(0)，在第一方工具指导之前
+  executionMode: '',
+  executionModeFile: '',
+  executionModeOrder: 30,
 
   // 人设库（多套人设 + 激活指针）
   //   指针缺失 / JSON 坏 / persona 字段非法 → 一律按 'legacy' 处理（读 armor\persona.md），
@@ -52,14 +62,17 @@ const DEFAULTS = {
   // 本地规则段（接 AGENTS.md 那套的活）
   rules: '',
   rulesFile: '',
-  rulesOrder: -1400,
+  rulesOrder: 20,
 
-  // 组装后处理
-  strip: true,
-  stripContexts: true,
-  stripTools: true,
+  // 组装后处理 —— v0.5.0 起默认全关：提示词增强层改成「只追加不改写」。
+  //   strip / stripTools / stripContexts 保留为可选开关（想回到改写模式就打开），
+  //   dropSections 默认空 = 官方身份句与 preset persona 原样保留。
+  //   这样官方升级改了措辞，本插件不会静默空转，也不会把正文吞掉。
+  strip: false,
+  stripContexts: false,
+  stripTools: false,
   stripRules: null,
-  dropSections: ['harness:identity', 'deployment:persona-prefix'],
+  dropSections: [],
   replaceSections: {},
   suppressRuntimeContext: false,
 
@@ -81,7 +94,10 @@ const DEFAULTS = {
   verbose: false,
 }
 
-const TOGGLE_KEYS = ['armed', 'recover', 'continue']
+const TOGGLE_KEYS = ['armed', 'personaOn', 'executionModeOn', 'recover', 'continue']
+
+// 最近一次改写层的命中情况（只在 wantsRewrite 时被写；面板据此判断「是不是在空转」）
+const lastRewrite = { hits: 0, by: null, at: '', error: '' }
 
 const SECTION_SPECS = [
   {
@@ -101,6 +117,16 @@ const SECTION_SPECS = [
     defaultFile: 'rules.md',
     bundledFile: './personas/default-rules.md',
     label: '规则',
+  },
+  {
+    // 追加层：官方段一个不动，只在 persona 之后插这一块。
+    // 不给 compose：执行契约是单文件正文，没有 _base 那套拼接。
+    key: 'executionMode',
+    section: 'armor:execution-mode',
+    orderKey: 'executionModeOrder',
+    defaultFile: 'execution-mode.md',
+    bundledFile: './personas/default-execution-mode.md',
+    label: '执行契约',
   },
 ]
 
@@ -290,7 +316,11 @@ function readPersona(config, active) {
     fallbackFrom = requested
   }
 
-  const base = target.kind === 'library' ? readBaseFragment(config) : { text: '', file: '' }
+  // _base 是「角色正文的硬约束前缀」。正文为空时它就成了孤儿：
+  // 既不是人设、也不受 personaOn 控制，白白往每轮请求里塞 ~321 token 的约束。
+  // 所以只在正文非空时才拼 —— 空正文的语义应该是「这段不注入」，不是「只注入前缀」。
+  const wantsBase = target.kind === 'library' && ownText.trim() !== ''
+  const base = wantsBase ? readBaseFragment(config) : { text: '', file: '' }
   const text = base.text.trim() ? `${base.text.trimEnd()}\n\n${ownText.trimEnd()}\n` : ownText
   return {
     ownText,
@@ -303,8 +333,10 @@ function readPersona(config, active) {
     requested,
     fallbackFrom,
     persisted: true,
+    // 正文为空时如实报 0：面板据此显示「注入时前置 _base 0 字节」，不骗人
     baseFile: base.file,
     baseBytes: Buffer.byteLength(base.text, 'utf8'),
+    baseSkipped: !wantsBase && target.kind === 'library',
   }
 }
 
@@ -422,10 +454,12 @@ function applyRules(text, rules, kind) {
 
 let dumpedOnce = false
 
-function rewrite(assembly, rules, config) {
+function rewrite(assembly, rules, config, stats) {
   const drop = new Set(config.dropSections ?? [])
   const replace = config.replaceSections ?? {}
   let hits = 0
+  // 分项命中：只用于面板诊断（哪一层真的改到了东西 / 哪一层在空转）
+  const hitBy = { dropped: 0, replaced: 0, sections: 0, contexts: 0, tools: 0 }
 
   if (config.dumpSections && !dumpedOnce) {
     dumpedOnce = true
@@ -438,15 +472,18 @@ function rewrite(assembly, rules, config) {
   for (const section of assembly.sections ?? []) {
     if (drop.has(section.name)) {
       hits += 1
+      hitBy.dropped += 1
       continue
     }
     if (Object.prototype.hasOwnProperty.call(replace, section.name)) {
       hits += 1
+      hitBy.replaced += 1
       sections.push({ ...section, text: replace[section.name], interpolate: false })
       continue
     }
     const got = applyRules(String(section.text ?? ''), rules, 'sections')
     hits += got.hits
+    hitBy.sections += got.hits
     sections.push(got.text === section.text ? section : { ...section, text: got.text })
   }
 
@@ -455,6 +492,7 @@ function rewrite(assembly, rules, config) {
     : (assembly.contexts ?? []).map((entry) => {
         const got = applyRules(String(entry.text ?? ''), rules, 'contexts')
         hits += got.hits
+        hitBy.contexts += got.hits
         return got.text === entry.text ? entry : { ...entry, text: got.text }
       })
 
@@ -469,29 +507,35 @@ function rewrite(assembly, rules, config) {
     tools = tools.map((tool) => {
       const got = applyRules(String(tool.description ?? ''), rules, 'tools')
       hits += got.hits
+      hitBy.tools += got.hits
       return got.text === tool.description ? tool : { ...tool, description: got.text }
     })
   }
 
+  if (stats) { stats.hits = hits; stats.by = hitBy }
   if (hits && config.verbose) console.log(`[armor-lite] rewrote ${hits} phrase(s)`)
   return { ...assembly, sections, contexts, tools }
 }
 
-// ── 三个开关：进程内即时生效 + 落盘持久化 ────────────────────────────────
-//   armed    破甲总开关（人设/规则段 + 组装后改写）
-//   recover  拒答自动恢复
-//   continue 空转续写（只在 reason.kind === 'max-tokens' 时补话）
+// ── 四个开关：进程内即时生效 + 落盘持久化 ────────────────────────────────
+//   armed     提示词增强总开关（人设/规则段 + 组装后改写）
+//   personaOn 人设段独立开关：只掐 armor:persona，rules 段与提示词改写照跑
+//   recover   拒答自动恢复
+//   continue  空转续写（只在 reason.kind === 'max-tokens' 时补话）
 // 旧版 state.json 只有 armed 一个键，缺的字段一律按「开」处理，向后兼容。
 function loadState() {
   try {
     const raw = JSON.parse(fs.readFileSync(stateFile(), 'utf8'))
     return {
       armed: raw.armed !== false,
+      personaOn: raw.personaOn !== false,
+      // 新增键：旧 state.json 没有它，缺省按「开」处理（与其余键一致）
+      executionModeOn: raw.executionModeOn !== false,
       recover: raw.recover !== false,
       continue: raw.continue !== false,
     }
   } catch {
-    return { armed: true, recover: true, continue: true }
+    return { armed: true, personaOn: true, executionModeOn: true, recover: true, continue: true }
   }
 }
 
@@ -500,12 +544,14 @@ function saveState(state) {
     fs.mkdirSync(armorDir(), { recursive: true })
     const body = `${JSON.stringify({
       armed: state.armed,
+      personaOn: state.personaOn,
+      executionModeOn: state.executionModeOn,
       recover: state.recover,
       continue: state.continue,
       updatedAt: new Date().toISOString(),
     }, null, 2)}\n`
     // 先写临时文件再改名：半截 JSON 会让下次 loadState 整个回落「全开」，
-    // 对破甲插件来说那等于悄悄把破甲打开 —— 代价比多一次 rename 大得多。
+    // 对提示词增强插件来说那等于悄悄把提示词增强打开 —— 代价比多一次 rename 大得多。
     const tmp = tmpNameOf(stateFile())
     fs.writeFileSync(tmp, body, 'utf8')
     fs.renameSync(tmp, stateFile())
@@ -532,7 +578,7 @@ function normalizeHardStop(list) {
       throw new TypeError(`hardStopPatterns[${i}] 需要字符串或 RegExp`)
     })
   } catch (error) {
-    // 一个坏正则不能让整个插件加载失败 —— 那等于破甲全线静默失效
+    // 一个坏正则不能让整个插件加载失败 —— 那等于提示词增强全线静默失效
     console.log(`[armor-lite] hardStopPatterns 配置有问题，回落内置硬停表：${String((error && error.message) || error)}`)
     return null
   }
@@ -541,7 +587,7 @@ function normalizeHardStop(list) {
 // ── 侧栏面板的数据面：同源于宿主 webServer（与 dshmarket 同款接法）──────
 //  active 是从 apply() 传进来的可变指针对象（属性会被 /activate 与轮询改写），
 //  不能靠闭包捕获 —— mountApi 是模块级函数，拿不到 apply 里的局部变量。
-function mountApi(hostCtx, state, slots, config, log, active) {
+function mountApi(hostCtx, state, slots, config, log, active, diag = {}) {
   const readJson = (req) => new Promise((resolve) => {
     let raw = ''
     req.on('data', (chunk) => {
@@ -627,14 +673,27 @@ function mountApi(hostCtx, state, slots, config, log, active) {
       if (req.method !== 'GET') return sendJson(res, 405, { error: 'GET only' })
       sendJson(res, 200, {
         armed: state.armed,
+        personaOn: state.personaOn,
+        executionModeOn: state.executionModeOn,
         recover: state.recover,
         continue: state.continue,
+        // 追加模式诊断：改写层是否在跑、命中多少、最近一次组装的官方段清单
+        layer: {
+          mode: config.strip !== false || config.stripTools === true || config.stripContexts === true ? 'rewrite' : 'append',
+          rewriteWired: config.strip !== false || config.stripTools === true || config.stripContexts === true
+            || (Array.isArray(config.dropSections) && config.dropSections.length > 0)
+            || Boolean(config.replaceSections && Object.keys(config.replaceSections).length > 0),
+          lastRewrite: diag.lastRewrite ?? null,
+          lastAssembly: diag.lastAssembly ?? null,
+        },
         home: armorDir(),
         watchIntervalMs: config.watchIntervalMs,
         recoverMax: clampCount(config.refusalRecoverMax, 2, 5),
         continueMax: clampCount(config.autoContinueMax, 3, 20),
-        persona: describe(slotOf('persona')),
-        rules: describe(slotOf('rules')),
+        // injecting：段里有内容 ≠ 段会被注入。面板要能说出这个差别，否则就是在骗自己
+        persona: { ...describe(slotOf('persona')), injecting: state.armed && state.personaOn },
+        rules: { ...describe(slotOf('rules')), injecting: state.armed },
+        executionMode: { ...describe(slotOf('executionMode')), injecting: state.armed && state.executionModeOn },
         active: { persona: active.persona },
         personas: {
           dir: personasDirOf(config),
@@ -685,6 +744,36 @@ function mountApi(hostCtx, state, slots, config, log, active) {
       const skipReason = explicitId
         ? `写的是库里的另一份（${explicitId}），当前注入的仍是 ${slot.inline ? 'YAML 内联值' : (slot.id || LEGACY_ID)}`
         : 'YAML 内联 config.persona 优先，保存文件不改变当前注入内容'
+
+      // 空正文护栏：写的是「当前正在生效的那份」且正文全空白 → 拒绝。
+      // 起因是一次真实事故：面板重启后编辑器还没回填，点保存把 116 字节的人设抹成 0 字节，
+      // 而且这种损坏是静默的（注入没报错，只是人设没了）。清空应该是显式意图，
+      // 所以要求带 confirmEmpty: true 才放行。
+      // 防截断护栏：这是第二次踩同一个坑 —— 一次保存把 1554B 的规则写成 67B。
+      // 判据：新内容比磁盘上的存量少 40% 以上，且调用方没说这是有意的 -> 拒绝。
+      // 「有意的缩减」用 shrink:true 放行（比如真的在精简提示词）。
+      let diskBytes = 0
+      try { diskBytes = fs.statSync(file).size } catch { /* 文件不存在：首次创建，放行 */ }
+      const newBytes = Buffer.byteLength(body.text, 'utf8')
+      if (diskBytes > 200 && newBytes < diskBytes * 0.6 && body.shrink !== true) {
+        return sendJson(res, 409, {
+          error: `拒绝大幅缩减：磁盘上 ${diskBytes} 字节，这次要写 ${newBytes} 字节（少 ${Math.round((1 - newBytes / diskBytes) * 100)}%）。真有意图请带 shrink: true`,
+          which: body.which,
+          path: file,
+          diskBytes,
+          newBytes,
+        })
+      }
+
+      const willWriteActive = wantsActivate || writesActive
+      if (willWriteActive && !body.text.trim() && body.confirmEmpty !== true) {
+        return sendJson(res, 409, {
+          error: '拒绝把正在生效的这份写成空正文。确实要清空请带 confirmEmpty: true',
+          which: body.which,
+          path: file,
+          hint: '清空后人设段会只剩 _base（或完全消失），这个操作不可从插件内撤销',
+        })
+      }
 
       try {
         fs.mkdirSync(path.dirname(file), { recursive: true })
@@ -738,7 +827,7 @@ function mountApi(hostCtx, state, slots, config, log, active) {
       if (req.method !== 'POST') return sendJson(res, 405, { error: 'POST only' })
       const body = await readJson(req)
       if (!body || typeof body.enabled !== 'boolean') {
-        return sendJson(res, 400, { error: '需要 { enabled: boolean, key?: "armed"|"recover"|"continue" }' })
+        return sendJson(res, 400, { error: '需要 { enabled: boolean, key?: "armed"|"personaOn"|"recover"|"continue" }' })
       }
       // key 省略 = armed，旧前端调用照旧能用
       const key = TOGGLE_KEYS.includes(body.key) ? body.key : 'armed'
@@ -749,6 +838,8 @@ function mountApi(hostCtx, state, slots, config, log, active) {
         ok: true,
         key,
         armed: state.armed,
+        personaOn: state.personaOn,
+        executionModeOn: state.executionModeOn,
         recover: state.recover,
         continue: state.continue,
         persisted,
@@ -931,7 +1022,7 @@ export function apply(ctx, rawConfig) {
   })
 
   // 1) 人设段 + 本地规则段。order 都低于 HARNESS_IDENTITY(-1000)，永远排在第一方指导之前。
-  //    text 是函数 → 每次组装重新求值；关掉破甲或文本为空时该段自动消失。
+  //    text 是函数 → 每次组装重新求值；关掉提示词增强或文本为空时该段自动消失。
   for (const slot of slots) {
     ctx.systemPrompt.section({
       name: slot.spec.section,
@@ -939,7 +1030,16 @@ export function apply(ctx, rawConfig) {
       interpolate: false,
       // 段文本收 context：compose 段（人设）用它做 {{cwd}}/{{model}} 替换。
       // 保持 interpolate:false 是刻意的 —— 宿主插值遇未知引用会抛错、整轮失败。
-      text: (context) => (state.armed ? (slot.spec.compose ? expandVars(slot.text, context, config) : slot.text) : ''),
+      // compose 段就是人设（SECTION_SPECS 里只有 persona 带 compose: true）。
+      // personaOn 只掐人设段；rules 段仍由 armed 单独决定，两者互不牵连。
+      // 三个独立闸：armed 总管；personaOn 只管人设；executionModeOn 只管执行契约。
+      // rules 段只受 armed 管（它装的是本机工作约束，不该被人设开关牵动）。
+      text: (context) => {
+        if (!state.armed) return ''
+        if (slot.spec.key === 'persona' && !state.personaOn) return ''
+        if (slot.spec.key === 'executionMode' && !state.executionModeOn) return ''
+        return slot.spec.compose ? expandVars(slot.text, context, config) : slot.text
+      },
     })
   }
 
@@ -947,7 +1047,7 @@ export function apply(ctx, rawConfig) {
   if (config.suppressRuntimeContext) ctx.systemPrompt.suppressRuntimeContext()
 
   // 3) 组装后改写：global + prepend = 最外层监听器，拥有最后一句话权。
-  //    破甲关掉时原样返回、什么都不动 = 原版行为。
+  //    提示词增强关掉时原样返回、什么都不动 = 原版行为。
   const rules = (() => {
     if (!Array.isArray(config.stripRules) || !config.stripRules.length) return DEFAULT_STRIP_RULES
     try {
@@ -958,19 +1058,51 @@ export function apply(ctx, rawConfig) {
       return DEFAULT_STRIP_RULES
     }
   })()
-  if (config.strip !== false) {
+  // v0.5.0：默认「只追加不改写」。改写层只在真的有诉求时才挂监听器 ——
+  // 没诉求还挂一个原样返回的全局监听器，等于每次组装多一层空转，也会让
+  // 「本次到底改没改」这件事在日志里无从分辨。
+  const wantsRewrite = config.strip !== false
+    || config.stripTools === true
+    || config.stripContexts === true
+    || (Array.isArray(config.dropSections) && config.dropSections.length > 0)
+    || (config.replaceSections && Object.keys(config.replaceSections).length > 0)
+
+  if (wantsRewrite) {
     ctx.on('system-prompt/assemble', async (assembly, _context, next) => {
       const done = typeof next === 'function' ? await next() : assembly
       if (!state.armed) return done
+      const stats = {}
       try {
-        return rewrite(done, rules, config)
+        const out = rewrite(done, rules, config, stats)
+        lastRewrite.hits = stats.hits ?? 0
+        lastRewrite.by = stats.by ?? null
+        lastRewrite.at = new Date().toISOString()
+        return out
       } catch (error) {
         // 改写表里若塞了会抛的 replace 函数，不能连带掀掉这次组装（整个 turn 会变 error）
         console.log(`[armor-lite] 组装后改写失败，本次原样返回：${String((error && error.message) || error)}`)
+        lastRewrite.error = String((error && error.message) || error)
         return done
       }
     }, { global: true, prepend: true })
   }
+
+  // 只读探针：把「本次组装里官方段都还在不在」记下来给面板看。
+  // 它不是改写，只是观察 —— 用来证明「只追加」真的没动官方文本。
+  const lastAssembly = { at: '', sections: [], injected: {} }
+  ctx.on('system-prompt/assemble', async (assembly, _context, next) => {
+    const done = typeof next === 'function' ? await next() : assembly
+    try {
+      lastAssembly.at = new Date().toISOString()
+      lastAssembly.sections = (done.sections ?? []).map((s) => ({ name: s.name, bytes: Buffer.byteLength(String(s.text ?? ''), 'utf8') }))
+      lastAssembly.injected = {
+        persona: Boolean(state.armed && state.personaOn),
+        rules: Boolean(state.armed),
+        executionMode: Boolean(state.armed && state.executionModeOn),
+      }
+    } catch { /* 探针失败不影响组装 */ }
+    return done
+  }, { global: true, prepend: true })
 
   // 4) 热更新：轮询而非 fs.watch —— 覆盖「文件还不存在 → 被创建」的情况。
   //    内联与否在每个 tick 现判、不在启动时固定：面板保存会把 slot.inline 置 false，
@@ -1023,7 +1155,7 @@ export function apply(ctx, rawConfig) {
   // 5) 侧栏面板的数据面：宿主有 webServer 才挂；headless 下插件照常工作
   ctx.inject(['webServer'], (hostCtx) => {
     hostCtx.effect(
-      () => mountApi(hostCtx, state, slots, config, log, active),
+      () => mountApi(hostCtx, state, slots, config, log, active, { lastRewrite, lastAssembly }),
       'armor-lite: panel api routes',
     )
   })
@@ -1048,5 +1180,5 @@ export function apply(ctx, rawConfig) {
     }))
   }
 
-  log(`armed (armed=${state.armed}, recover=${state.recover}, continue=${state.continue}, sections=${slots.length}, strip=${config.strip !== false}, rules=${rules.length}, drop=${(config.dropSections ?? []).length})`)
+  log(`armed (armed=${state.armed}, personaOn=${state.personaOn}, executionModeOn=${state.executionModeOn}, recover=${state.recover}, continue=${state.continue}, sections=${slots.length}, layer=${wantsRewrite ? 'replace' : 'append'}, rules=${rules.length}, drop=${(config.dropSections ?? []).length})`)
 }

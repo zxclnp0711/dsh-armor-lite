@@ -1,7 +1,7 @@
-// dsh-armor-lite — 破甲面板（Client 半）
+// dsh-armor-lite — 提示词增强面板（Client 半）
 //
 // 由 dsh.client（package.json）经 __ModuleLoader__ 加载，并在侧栏「插件 / 上下文洞察」
-// 那一组里加一个「破甲」入口（sidebar.panellist id=armor, order=30），点开是中央面板
+// 那一组里加一个「提示词增强」入口（sidebar.panellist id=armor, order=30），点开是中央面板
 // （main key=armor）。与 dsh-context 的挂法一致。
 //
 // 数据面走 Host 半的 /dsh-armor/api/*（与宿主 webServer 同源）。
@@ -57,8 +57,8 @@ window.__ModuleLoader__.load({
     // ── 控件 ──────────────────────────────────────────────────────────
     function Switch({
       on, busy, onChange, compact,
-      onText = '破甲 · 已开启', offText = '破甲 · 已关闭',
-      onTitle = '点击关闭破甲（回到原版提示词）', offTitle = '点击开启破甲',
+      onText = '提示词增强 · 已开启', offText = '提示词增强 · 已关闭',
+      onTitle = '点击关闭（回到原版提示词）', offTitle = '点击开启',
     }) {
       return h('button', {
         type: 'button',
@@ -250,7 +250,8 @@ window.__ModuleLoader__.load({
       const [note, setNote] = React.useState(null)
       const [persona, setPersona] = React.useState('')
       const [rules, setRules] = React.useState('')
-      const [dirty, setDirty] = React.useState({ persona: false, rules: false })
+      const [execMode, setExecMode] = React.useState('')
+      const [dirty, setDirty] = React.useState({ persona: false, rules: false, executionMode: false })
       // 面板正在看/编辑的那份人设：点下拉只改它，点「保存」才写盘并切生效
       const [selected, setSelected] = React.useState('')
       // 有未保存草稿时切换预览要二次确认；这里记「待确认的目标 id」
@@ -273,9 +274,10 @@ window.__ModuleLoader__.load({
           setData(body)
           setPersona(body.persona.text || '')
           setRules(body.rules.text || '')
+          setExecMode((body.executionMode && body.executionMode.text) || '')
           setSelected((body.active && body.active.persona) || 'legacy')
           setPreviewMeta(null)
-          setDirty({ persona: false, rules: false })
+          setDirty({ persona: false, rules: false, executionMode: false })
           setNote(null)
         } catch (e) {
           if (alive.current) setNote({ kind: 'err', text: `读取失败：${e.message}` })
@@ -303,14 +305,14 @@ window.__ModuleLoader__.load({
           setRules(body.rules.text || '')
           setSelected((body.active && body.active.persona) || 'legacy')
           setPreviewMeta(null)
-          setDirty({ persona: false, rules: false })
+          setDirty({ persona: false, rules: false, executionMode: false })
         } catch { /* 拉不到就保持当前显示 */ }
       }
 
       const save = async (which) => {
         setBusy('save')
         try {
-          const text = which === 'persona' ? persona : rules
+          const text = which === 'persona' ? persona : which === 'executionMode' ? execMode : rules
           // 人设段：保存 = 写入当前预览的这份 + 把它设为生效（面板「保存」的语义）。
           // rules 段没有多份，维持旧行为。
           const payload = { which, text }
@@ -334,7 +336,17 @@ window.__ModuleLoader__.load({
           }
           await syncFromServer()
         } catch (e) {
-          if (alive.current) setNote({ kind: 'err', text: `保存失败：${e.message}` })
+          if (alive.current) {
+            // 409 = 空正文护栏。这不是 bug，是插件拒绝了「把生效中的这份清空」。
+            const msg = String(e.message || e)
+            const isGuard = /拒绝把正在生效的这份写成空正文/.test(msg)
+            setNote({
+              kind: 'warn',
+              text: isGuard
+                ? `保存被拦下：${msg}。如果编辑器是空的，先点「重新读取」确认拉到了内容再改。`
+                : `保存失败：${msg}`,
+            })
+          }
         } finally {
           if (alive.current) setBusy('')
         }
@@ -423,8 +435,12 @@ window.__ModuleLoader__.load({
 
       const NOTE = {
         armed: {
-          on: '破甲已开启：人设/规则段生效，固定身份开场白被剔除，削减文案改写生效。',
-          off: '破甲已关闭：人设/规则段清空、改写停用、身份开场白恢复 —— 等同于原版 DSH。',
+          on: '提示词增强已开启：人设/规则段生效，固定身份开场白被剔除，削减文案改写生效。',
+          off: '提示词增强已关闭：人设/规则段清空、改写停用、身份开场白恢复 —— 等同于原版 DSH。',
+        },
+        personaOn: {
+          on: '人设已注入：armor:persona 段生效（含 _base 硬约束）。',
+          off: '人设已停用：armor:persona 段不注入；规则段与提示词改写不受影响。',
         },
         recover: {
           on: '拒答恢复已开启：一轮正常收尾但内容是拒答时，自动补一句把它顶回去（每轮上限 2 次）。',
@@ -466,9 +482,9 @@ window.__ModuleLoader__.load({
 
       if (!data) {
         return wrap([
-          h('h2', { key: 't', style: { margin: 0, fontSize: 18, fontWeight: 700 } }, '破甲'),
+          h('h2', { key: 't', style: { margin: 0, fontSize: 18, fontWeight: 700 } }, '提示词增强'),
           h('div', { key: 's', style: { marginTop: 12, fontSize: 13, color: note ? T.err : T.label2 } },
-            busy === 'load' ? '读取中…' : (note ? note.text : '无法读取破甲状态')),
+            busy === 'load' ? '读取中…' : (note ? note.text : '无法读取状态')),
           note ? h('div', { key: 'r', style: { marginTop: 14 } },
             h(Btn, { onClick: () => void load(), primary: true }, '重试')) : null,
         ])
@@ -477,6 +493,7 @@ window.__ModuleLoader__.load({
       const tone = note ? (note.kind === 'ok' ? T.ok : note.kind === 'warn' ? T.warn : T.err) : T.label2
       const metaOf = (slot) => {
         const parts = [`${slot.source || slot.path || '(未知来源)'} · ${slot.bytes} 字节`]
+        if (slot.injecting === false) parts.push('⚠ 当前未注入（人设开关或总开关关闭）')
         if (slot.persisted === false) parts.push('尚未落盘，保存后写入该路径')
         if (slot.inline) parts.push('来自 YAML 内联值（保存后改写到文件）')
         if (slot.kind === 'library') parts.push(`库模式 · ${slot.id}`)
@@ -498,16 +515,29 @@ window.__ModuleLoader__.load({
           + ' · 尚未生效'
         : metaOf(data.persona)
       const rulesMeta = metaOf(data.rules)
+      const execModeMeta = metaOf(data.executionMode)
 
       return wrap([
         h('div', {
           key: 'head',
           style: { display: 'flex', alignItems: 'center', gap: 16, flexWrap: 'wrap' },
         },
-          h('h2', { style: { margin: 0, fontSize: 18, fontWeight: 700 } }, '破甲'),
+          h('h2', { style: { margin: 0, fontSize: 18, fontWeight: 700 } }, '提示词增强'),
           h('span', { style: { fontSize: 12, color: T.label2 } },
             '运行时改写系统提示词 · 不改任何官方文件'),
           h('span', { style: { flex: 1 } }),
+          h(Switch, {
+            on: !!data.executionModeOn, busy: busy === 'toggle', compact: true,
+            onChange: (v) => void toggle('executionModeOn', v),
+            onText: '执行契约 · 开', offText: '执行契约 · 关',
+            onTitle: 'armor:execution-mode 段会注入（只追加，不改写官方段）；点击停用', offTitle: '点击恢复执行契约注入',
+          }),
+          h(Switch, {
+            on: !!data.personaOn, busy: busy === 'toggle', compact: true,
+            onChange: (v) => void toggle('personaOn', v),
+            onText: '人设 · 开', offText: '人设 · 关',
+            onTitle: 'armor:persona 段会注入（含 _base）；点击停用', offTitle: '点击恢复人设注入',
+          }),
           h(Switch, { on: !!data.armed, busy: busy === 'toggle', onChange: (v) => void toggle('armed', v) }),
         ),
 
@@ -519,10 +549,32 @@ window.__ModuleLoader__.load({
             fontSize: 12, color: T.label2, lineHeight: 1.75,
           },
         },
-          h('div', {}, '段顺序：armor:persona (-1500) → armor:rules (-1400) → 第一方指导'),
-          h('div', {}, '剔除的身份段：harness:identity、deployment:persona-prefix'),
+          h('div', {}, `层模式：${data.layer && data.layer.mode === 'rewrite' ? '改写模式（会改动官方段）' : '追加模式（官方段逐字不动）'}`),
+          h('div', {}, '段顺序：armor:persona (-1500) → armor:rules (-1400) → harness:identity (-1000) → deployment:persona-prefix (0) → armor:execution-mode (30) → 第一方指导'),
+          h('div', {}, '官方段（harness:identity / deployment:persona-prefix / plan:policy / tools:ptc-only）默认逐字保留，本插件只往后追加'),
           h('div', {}, `文件目录：${data.home}`),
-          h('div', {}, `外部直接改人设/规则文件会在 ${data.watchIntervalMs || 2000} ms 内被读到；三个开关写在 state.json，当前人设写在 active.json —— 重启后都保持（外部直接改 state.json 要重启才读，改 active.json 不用）。`),
+          h('div', {}, `外部直接改人设/规则/执行契约文件会在 ${data.watchIntervalMs || 2000} ms 内被读到；五个开关写在 state.json，当前人设写在 active.json —— 重启后都保持（外部直接改 state.json 要重启才读，改 active.json 不用）。`),
+          (() => {
+            const asm = data.layer && data.layer.lastAssembly
+            if (!asm || !asm.at) return h('div', {}, '尚未采集到组装样本：发一条消息后这里会显示官方段是否还在')
+            const missing = ['harness:identity', 'deployment:persona-prefix'].filter(
+              (name) => !(asm.sections || []).some((s) => s.name === name))
+            const injected = asm.injected || {}
+            return h('div', { style: { color: missing.length ? T.warn : T.label2 } },
+              `最近一次组装 ${asm.at}：${(asm.sections || []).length} 段 · 注入 `
+              + `人设=${injected.persona ? '是' : '否'} / 规则=${injected.rules ? '是' : '否'} / 执行契约=${injected.executionMode ? '是' : '否'}`
+              + (missing.length ? ` · ⚠ 官方段缺失：${missing.join('、')}（说明改写层被打开了）` : ' · 官方段齐备'))
+          })(),
+          (() => {
+            const rw = data.layer && data.layer.lastRewrite
+            if (data.layer && data.layer.mode !== 'rewrite') return null
+            if (!rw || !rw.at) return h('div', {}, '改写层已挂上，尚未观察到命中')
+            return h('div', { style: { color: rw.hits > 0 ? T.label2 : T.warn } },
+              `最近改写 ${rw.at}：命中 ${rw.hits} 处`
+              + (rw.by ? `（剔段 ${rw.by.dropped} / 换段 ${rw.by.replaced} / sections ${rw.by.sections} / contexts ${rw.by.contexts} / tools ${rw.by.tools}）` : '')
+              + (rw.hits === 0 && !rw.error ? ' · ⚠ 一条都没命中，改写表可能已与官方文案脱节' : '')
+              + (rw.error ? ` · ⚠ 上次改写抛错：${rw.error}` : ''))
+          })(),
         ),
 
         h('div', {
@@ -547,7 +599,7 @@ window.__ModuleLoader__.load({
             onTitle: '输出被 max-tokens 截断时自动补「继续」；点击关闭', offTitle: '点击开启',
           }),
           h('span', { style: { fontSize: 11.5, color: T.label2 } },
-            `每轮上限 ${data.recoverMax ?? 2} / ${data.continueMax ?? 3} 次；破甲总开关关掉时这两个也停。`),
+            `每轮上限 ${data.recoverMax ?? 2} / ${data.continueMax ?? 3} 次；总开关关掉时这两个也停。`),
         ),
 
         note ? h('div', {
@@ -585,6 +637,15 @@ window.__ModuleLoader__.load({
           onSave: () => void save('rules'),
           onReload: () => void load(),
         }),
+
+        h(Editor, {
+          key: 'executionMode',
+          title: '执行契约', hint: '段 armor:execution-mode（order 30，紧跟官方 persona 之后）· 只追加，不改写官方段',
+          value: execMode, meta: execModeMeta, dirty: dirty.executionMode, busy,
+          onChange: (v) => { setExecMode(v); setDirty((d) => ({ ...d, executionMode: true })) },
+          onSave: () => void save('executionMode'),
+          onReload: () => void load(),
+        }),
       ])
     }
 
@@ -615,12 +676,12 @@ window.__ModuleLoader__.load({
           key: 'armor',
         }, () => h(ArmorPanel)))
 
-        // 侧栏入口：插件(0) / 破甲(30) / 上下文洞察(20) 同一组
+        // 侧栏入口：插件(0) / 提示词增强(30) / 上下文洞察(20) 同一组
         ctx.slots.inject('sidebar.panellist', () => ctx.slots.register({
           name: 'sidebar.panellist',
           id: 'armor',
           order: 30,
-          label: '破甲',
+          label: '提示词增强',
         }, (props) => h(ArmorGlyph, { size: props && props.size })))
       },
     }

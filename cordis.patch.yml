@@ -1,10 +1,12 @@
 # dsh-armor-lite bundle patch
 #
-# 层一：零代码覆写。等价于 dsh-purge 的「shim 层 + 代码层 #6~#10」，但不动任何文件，
-# 也不依赖环境变量——重启后依然生效。
-#
-# 注意：行按 id 覆盖「整行 config」（非深度合并），所以原行有的字段必须一并写回。
+# 两件互相独立的事，别再混在一起看：
+#   层A 权限层（sandbox-policy / approval）—— 决定「能不能写文件、要不要审批」
+#   层B 提示词层（下面 insert 的那行）—— 决定「说什么、说多全」
+# 提示词增强只属于层B。层A 放这么宽是为了工作流顺手，不是因为提示词增强需要它。
+# 想恢复官方默认（只读沙箱 + 手动审批）：把下面两行注释掉即可，提示词层不受影响。
 
+# ── 层A：权限放行（与提示词增强无关，按需保留）──
 - id: sandbox-policy
   config:
     mode: danger-full-access
@@ -26,13 +28,16 @@
         #   → legacy（$DSH_HOME\armor\persona.md）→ 内置 personas\default.md
         # 规则段不进库（本机 Windows 写法 / 服务器 Linux 写法，同一份内容不通用）：
         #   $DSH_HOME\armor\rules.md → 段 armor:rules（order -1400，紧跟人设之后）
-        # 两个文件都可以在侧栏「破甲」面板里直接改、直接存。
+        # 两个文件都可以在侧栏「提示词增强」面板里直接改、直接存。
         persona: ''
         personaFile: ''
-        personaOrder: -1500
+        # v0.6.0 降级：10 排在 harness:identity(-1000) 与 deployment:persona-prefix(0) 之后。
+        # 旧值 -1500 是"前置压制"（人设先于官方身份句），属于改写派的残留；
+        # 追加式不需要抢占位置 —— 官方段原样在前，本插件接在后面。
+        personaOrder: 10
         rules: ''
         rulesFile: ''
-        rulesOrder: -1400
+        rulesOrder: 20
 
         # ── 人设库 ──
         # 留空即默认：$DSH_HOME\armor\personas 与 $DSH_HOME\armor\active.json
@@ -44,15 +49,23 @@
         # （刻意不用宿主插值：它对未知引用直接抛错，整轮请求会失败）
         interpolateVars: true
 
-        # ── 组装后改写（最后一句话权）──
-        strip: true
-        stripContexts: true
-        # 工具描述也要洗（模型选工具的依据；purge 靠文件补丁改这层，这里运行时改）
-        stripTools: true
-        # 按段名整段剔除：抹掉两句固定身份开场白
-        dropSections:
-          - 'harness:identity'
-          - 'deployment:persona-prefix'
+        # ── 执行契约（追加层，v0.5.0 主体）──
+        # 正文走 $DSH_HOME\armor\execution-mode.md → 内置 personas/default-execution-mode.md
+        # 段名 armor:execution-mode，order 30：紧跟 deployment:persona-prefix(0)，在第一方指导之前。
+        # 只追加，不改写 —— 官方段一个字不动。
+        executionMode: ''
+        executionModeFile: ''
+        executionModeOrder: 30
+
+        # ── 组装后改写：默认全关（v0.5.0 起）──
+        # 打开它们就回到旧的「改写式」：删官方身份句、正则改写官方措辞。
+        # 代价是官方一改文案就静默空转，且正则跨行的坑要自己盯着。
+        # 只想应急时，用面板上的「层模式」看当前到底挂没挂改写层。
+        strip: false
+        stripContexts: false
+        stripTools: false
+        # 按段名整段剔除：默认空 = 官方身份句与 preset persona 原样保留
+        dropSections: []
         # 按段名整段替换：{ '段名': '新文本' }
         replaceSections: {}
         # 自定义改写表（{ pattern, flags, replace }）；null = 用 strip-rules.js
