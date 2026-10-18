@@ -9,7 +9,7 @@ DeepSeek Harness 的**轻量提示词增强插件**：只改运行时，不改�
 - **拒答恢复**：一轮正常收尾但内容是拒答时自动补话顶回去；被 max-tokens 截断时自动续写（事件层，可关）
 - **官方更新免疫**：不发一个补丁到 `node_modules`，官方覆盖文件也打不回来
 
-## v0.5.0 为什么改成「只追加」
+## 为什么从改写式改成「只追加」（v0.5.0 起）
 
 旧版是**改写式**：删掉官方的 `harness:identity` 与 `deployment:persona-prefix`，再用一张正则表把官方措辞改写成目标语义。
 
@@ -29,12 +29,12 @@ DeepSeek Harness 的**轻量提示词增强插件**：只改运行时，不改�
 | 失效检测 | 靠猜 | 面板显示最近一次组装的段清单 + 改写命中数 |
 
 改写层没被删掉，只是**降级为可选开关**（`strip` / `stripContexts` / `stripTools` / `dropSections` / `replaceSections`），默认全关。
-真想回到改写式，在 `cordis.patch.yml` 里打开即可，面板的「层模式」会显示当前是哪一派。
+真想回到改写式，在 `cordis.patch.yml` 里打开即可，面板的「层模式」会显示当前是追加还是改写。
 
 ## 安装
 
 ```sh
-# 从仓库装（私有仓：本机需先有可用的 SSH key 并已加到 GitHub）
+# 从仓库装（SSH 方式需要本机有可用 key；仓库当前是 public，也可直接用 https）
 dsh plugin --profile desktop add github:zxclnp0711/dsh-armor-lite
 
 # 或从本地目录装
@@ -66,7 +66,7 @@ dsh-armor-lite/
    └─ dump-prompt.mjs    # 从会话日志里捞出渲染后的系统提示词
 ```
 
-## 四个工作机制
+## 五个工作机制
 
 ### 1. 权限层（纯 YAML，零代码，与提示词层无关）
 
@@ -111,9 +111,10 @@ dsh-armor-lite/
 单用白名单有个盲区——模型可以字段填满但内容空洞地给一个阉割答案，所以契约层里配了一条**软降级禁令**
 （摘要代替正文、伪代码代替实现、更安全的变体代替原方案，都算失败交付）。
 
-### 2. 人设库 + 规则段
+### 3. 人设库 + 规则段
 
-两段注册在 `order -1500 / -1400`，都低于 harness 身份的 `-1000`，因此**永远排在第一方指导之前**：
+三段分别注册在 `order 10 / 20 / 30`，都排在官方 `harness:identity`（-1000）与 `deployment:persona-prefix`（0）**之后**，
+是第一方工具指导（1000+）**之前**：
 
 | 段名 | 内容来源 | order |
 |---|---|---|
@@ -173,7 +174,7 @@ tools:ptc-only              800   官方 PTC 规则
 段文本是函数、每次组装重新求值 → 改文件即时生效，不需要重启。2 秒轮询兜底"文件还不存在 → 被创建"，
 并且**同时盯着 `active.json`** —— 手改指针同样 2 秒生效。
 
-### 3. 组装后改写（拥有最后一句话权）
+### 4. 组装后改写（拥有最后一句话权）
 
 ```js
 ctx.on('system-prompt/assemble', async (assembly, _context, next) => {
@@ -185,7 +186,7 @@ ctx.on('system-prompt/assemble', async (assembly, _context, next) => {
 
 `rewrite()` 做四件事，全部只作用于文本、不改变段的数量与顺序：
 
-1. `dropSections` — 按段名整段剔除，默认 `harness:identity` + `deployment:persona-prefix`（两句固定身份开场白）
+1. `dropSections` — 按段名整段剔除，默认 `[]`（官方身份开场白原样保留；打开改写才会剔）
 2. `replaceSections` — 按段名整段替换
 3. `stripRules` — 正则改写表（`strip-rules.js`），默认含三段 `dsh-agent-instructions` 降级文案、「审批 / 升级」一组、「工具结果定性」一组的逐字核对版
 4. `stripTools` — 工具描述（`assembly.tools[].description`）也过一遍改写表
@@ -194,7 +195,7 @@ ctx.on('system-prompt/assemble', async (assembly, _context, next) => {
 
 核对方式：会话日志里的 `request/header` 事件记录了完整的 tools schema。实测本机最后一次请求的 58 个工具，`description` 里没有这类措辞，`stripTools` 命中 0。留着它是防宿主升级后把文案挪进 `description`；命中 0 时原样返回对象，没有副作用。
 
-### 4. 拒答恢复 / 空转续写（事件层）
+### 5. 拒答恢复 / 空转续写（事件层）
 
 `refusal-recover.js`。监听 `agent/status`，在 `status === 'idle'` 时读该会话最后一个 `turn/end`：
 
@@ -224,7 +225,7 @@ ctx.on('agent/status', (payload) => {
 
 ## 设置面板
 
-侧栏会出现一个**提示词增强**入口（在「插件」「上下文洞察」同一组，`sidebar.panellist` 的 `armor` 格 `order 30`），点开是中央面板（`main` 的 `armor` 键），三个功能：
+侧栏会出现一个**提示词增强**入口（在「插件」「上下文洞察」同一组，`sidebar.panellist` 的 `armor` 格 `order 30`），点开是中央面板（`main` 的 `armor` 键）：
 
 | 功能 | 行为 |
 |---|---|
@@ -280,12 +281,13 @@ ctx.on('agent/status', (payload) => {
 | `activeFile` | `''` | 激活指针；留空 = `$DSH_HOME/armor/active.json` |
 | `baseFragment` | `'default'` | 硬约束片段目录（相对 `personaDir`）；`'default'` = `_base`，`''` = 不拼 |
 | `interpolateVars` | `true` | `{{cwd}}`/`{{model}}`/`{{home}}`/`{{date}}` 的最小替换；未知引用原样保留 |
-| `personaOrder` / `rulesOrder` | `-1500` / `-1400` | 段顺序；必须低于 `-1000` 才能压过 harness 身份 |
-| `strip` | `true` | 是否启用组装后改写 |
-| `stripContexts` | `true` | 是否把改写也应用到动态 runtime 上下文 |
-| `stripTools` | `true` | 是否把改写也应用到工具描述（`tools[].description`） |
+| `executionMode` / `executionModeFile` | `''` / `''` | 执行契约段内联文本 / 显式路径；都空则读 `$DSH_HOME/armor/execution-mode.md`，再退到内置 |
+| `personaOrder` / `rulesOrder` / `executionModeOrder` | `10` / `20` / `30` | 段顺序；v0.6.0 起排在官方段之后（旧版是 -1500/-1400） |
+| `strip` | `false` | 是否启用组装后改写（v0.5.0 起默认关） |
+| `stripContexts` | `false` | 是否把改写也应用到动态 runtime 上下文 |
+| `stripTools` | `false` | 是否把改写也应用到工具描述（`tools[].description`） |
 | `stripRules` | `null` | 自定义改写表（`{pattern, flags, replace}`）；`null` 用 `strip-rules.js` |
-| `dropSections` | `['harness:identity','deployment:persona-prefix']` | 按段名整段剔除 |
+| `dropSections` | `[]` | 按段名整段剔除；默认空 = 官方身份句原样保留 |
 | `replaceSections` | `{}` | 按段名整段替换 |
 | `suppressRuntimeContext` | `false` | 掐掉全部动态 runtime 上下文 |
 | `refusalRecover` | `true` | 拒答自动恢复总闸（与面板的开关是「与」关系） |
@@ -355,9 +357,9 @@ node tools/persona-lint.mjs --legacy    # 人设结构检查（首行 + 9 段、
 
 | | dsh-purge | dsh-armor-lite |
 |---|---|---|
-| 注入层数 | 提示词 + 代码 + shim + override 四层、74 条补丁 | YAML 两行 + 一段运行时改写 + 一个事件层 |
+| 注入层数 | 提示词 + 代码 + shim + override 四层、74 条补丁 | YAML 两行 + 三段追加注入 + 一个事件层 |
 | 是否改官方文件 | 改（并留 `.bak`，官方更新后需重打） | **不改** |
-| 文件量 | 60+ 个，core.js 单文件 282 KB | 8 个，最大 16 KB |
+| 文件量 | 60+ 个，core.js 单文件 282 KB | 4 个 js/mjs + 人设库，最大 `index.js` 约 54 KB |
 | 官方更新后 | 需重新 apply | 自动继续生效 |
 | 拒答恢复 | 有 | 有（这里也抄了，并按本机源码校正过三处） |
 | 演练台 / 事实库 / rewind | 有 | 不需要 |
