@@ -20,7 +20,8 @@
     "strip-rules.js",
     "refusal-recover.js",
     "cordis.patch.yml",
-    "personas"
+    "personas",
+    "tools/dump-prompt.mjs"
   ],
   "dsh": {
     "bundle": {
