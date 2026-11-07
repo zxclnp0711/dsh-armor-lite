@@ -1,7 +1,7 @@
 {
   "name": "dsh-armor-lite",
   "version": "0.6.0",
-  "description": "轻量提示词增强：只追加不改写（执行契约段）+ 人设库 + 规则层分离 + 拒答恢复 + 侧栏管理面板；改写层降为可选开关",
+  "description": "轻量提示词增强：只追加不改写（执行契约段）+ 人设库 + 规则层分离 + 侧栏管理面板；改写层降为可选开关",
   "type": "module",
   "main": "index.js",
   "scripts": {
